@@ -57,6 +57,7 @@ class ClaudeBedrockClient:
                 "trace": "enabled",
             }
 
+        start_t = time.time()
         try:
             response = self.client.converse(**params)
         except ClientError as err:
@@ -68,17 +69,19 @@ class ClaudeBedrockClient:
             )
             params["modelId"] = self.config.fallback_model_id
             response = self.client.converse(**params)
+        latency_ms = (time.time() - start_t) * 1000.0
 
         usage = response.get("usage", {})
         input_tokens = usage.get("inputTokens", 0)
         output_tokens = usage.get("outputTokens", 0)
         active_model = params["modelId"]
 
-        telemetry_attrs = GenAITelemetry.create_span_attributes(
+        telemetry_attrs = GenAITelemetry.emit_turn_telemetry(
             model_id=active_model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             tenant_id=tenant_id,
+            latency_ms=latency_ms,
         )
 
         output_message = response.get("output", {}).get("message", {})

@@ -81,6 +81,13 @@
     },
     "FinalizeResponse": {
       "Type": "Pass",
+      "Parameters": {
+        "status": "SUCCEEDED",
+        "auth_context.$": "$.auth_context",
+        "messages.$": "$.messages",
+        "iteration.$": "$.iteration",
+        "telemetry.$": "$.telemetry"
+      },
       "End": true
     },
     "MaxIterationsFallback": {

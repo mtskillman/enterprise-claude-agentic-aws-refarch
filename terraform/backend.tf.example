@@ -1,0 +1,24 @@
+# ==============================================================================
+# Production Terraform Backend Configuration (Example)
+# ==============================================================================
+# To prevent local state files and maintain zero-trust state hygiene, configure
+# an encrypted Amazon S3 remote backend with DynamoDB state locking.
+#
+# Usage:
+#   1. Copy this file to `backend.tf`:
+#        cp backend.tf.example backend.tf
+#   2. Replace <ACCOUNT_ID>, <REGION>, and <KMS_KEY_ARN> with your environment values.
+#   3. Initialize the backend:
+#        terraform init -migrate-state
+# ==============================================================================
+
+terraform {
+  backend "s3" {
+    bucket         = "enterprise-claude-tfstate-<ACCOUNT_ID>"
+    key            = "reference-architecture/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    kms_key_id     = "arn:aws:kms:us-east-1:<ACCOUNT_ID>:key/<KMS_KEY_ID>"
+    dynamodb_table = "terraform-state-lock"
+  }
+}

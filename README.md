@@ -39,6 +39,7 @@ flowchart TD
 
         User -->|"1. Authenticate"| Cognito
         User -->|"2. POST /v1/agent/executions with Bearer JWT"| APIGW
+        User -->|"4. GET /v1/agent/executions/{id} (Poll Results)"| APIGW
         APIGW --> GatekeeperLambda
         GatekeeperLambda <--> SecretsManager
     end
@@ -97,7 +98,7 @@ flowchart TD
     end
 
     InvokeClaude <--> Guardrails
-    FormatResponse --> User
+    GatekeeperLambda -.->|"Deliver Verified Response"| User
 ```
 
 ---
@@ -131,7 +132,23 @@ To satisfy enterprise SOC2, HIPAA, and ISO 27001 requirements, 100% of persisted
 Rather than sharing a single broad execution role across services, the architecture enforces strict boundary separation across three specialized roles:
 1. **Orchestrator Role (`orchestrator_exec`)**: Scoped to Bedrock Claude (Sonnet/Haiku) and Titan embeddings invoke, read-only search on OpenSearch Serverless (`aoss:ReadDocument`, `aoss:DescribeIndex`), and Secrets Manager HMAC secret read. **Has zero S3 bucket access.**
 2. **Ingestion Role (`ingestion_exec`)**: Scoped to Titan embeddings invocation only (**cannot invoke Claude generative LLMs**), read-only access to `s3://<bucket>/tenants/*`, and write/index permissions on OpenSearch Serverless (`aoss:WriteDocument`, `aoss:CreateIndex`).
-3. **Auth Gatekeeper Role (`auth_gatekeeper_exec`)**: Scoped strictly to starting Step Functions executions and reading the HMAC signing secret.
+3. **Auth Gatekeeper Role (`auth_gatekeeper_exec`)**: Scoped strictly to managing Step Functions executions (`StartExecution`, `DescribeExecution`) and managing the HMAC signing secret container.
+
+### 6. Complete Asynchronous Query Lifecycle & Result Delivery
+Unlike naive prototypes that accept requests and drop results into a black box, this architecture implements a production-grade asynchronous lifecycle:
+- **`POST /v1/agent/executions`**: Validates JWT tenant claims, seals `VerifiedTenantContext`, initiates the Step Functions state machine, and immediately returns HTTP `202 ACCEPTED` with `execution_id`, `execution_arn`, and `poll_url`.
+- **`GET /v1/agent/executions/{execution_id}`**: Enables clients to poll execution health. When `RUNNING`, it returns progress metadata. When `SUCCEEDED`, it **strictly verifies that the execution's sealed `tenant_id` matches the caller's JWT `custom:tenant_id`**, preventing any horizontal privilege escalation (IDOR), and delivers the assistant's final response text, reasoning iterations, and FinOps telemetry.
+
+### 7. Zero-Trust State Hygiene & Lambda Dependency Layering
+- **Zero Sensitive Data in Terraform State**: Plaintext HMAC signing keys are never declared via `random_password` or written to `.tfstate`. The Gatekeeper Lambda auto-seeds a cryptographically secure 256-bit key on first boot directly in AWS Secrets Manager under KMS CMK encryption (or operators seed/rotate it out-of-band via `scripts/seed_hmac_secret.sh`).
+- **Deterministic Dependency Layering**: An automated Lambda Layer (`opensearch_dependencies`) compiles Linux x86_64 binary wheels for `opensearch-py 2.8.0` and `requests-aws4auth 1.3.1`, ensuring seamless runtime operation and preventing `ImportError` blockers during index bootstrapping.
+- **Remote Backend Baseline**: Includes `terraform/backend.tf.example` configuring encrypted S3 state with DynamoDB locking.
+
+### 8. Real-Time CloudWatch EMF & OpenTelemetry GenAI FinOps Telemetry
+Model invocations are instrumented with **CloudWatch Embedded Metric Format (EMF)** and OpenTelemetry GenAI Semantic Conventions v1.27.0:
+- Zero-latency metric publication to custom CloudWatch namespace `EnterpriseClaude/AgenticWorkflows`.
+- Real-time attribution of `EstimatedCostUSD`, `InputTokens`, `OutputTokens`, and `TurnLatencyMs` dimensioned by `TenantId` and `ModelId`.
+- CloudWatch Dashboard with dynamic regional support tracking real-time dollar costs and token burn per tenant.
 
 ---
 
@@ -141,39 +158,48 @@ Rather than sharing a single broad execution role across services, the architect
 .
 ├── LICENSE
 ├── README.md
+├── requirements.txt              # Runtime dependencies (opensearch-py, requests-aws4auth)
 ├── docs/
 │   └── adr/
 │       ├── 0001-bedrock-claude-vs-direct-api.md
 │       ├── 0002-opensearch-serverless-vs-pgvector.md
 │       ├── 0003-step-functions-vs-in-memory-loops.md
-│       └── 0004-cryptographic-tenant-isolation-and-iam-separation.md
+│       ├── 0004-cryptographic-tenant-isolation-and-iam-separation.md
+│       └── 0005-dependency-layering-async-delivery-and-state-security.md
+├── scripts/
+│   ├── build_layer.sh            # Automated Lambda Layer packager for opensearch-py
+│   └── seed_hmac_secret.sh       # Out-of-band CSPRNG HMAC secret seed and rotation
 ├── src/
 │   ├── auth/
 │   │   ├── __init__.py
-│   │   └── handler.py            # API Gateway JWT gatekeeper; mints signed tenant context
+│   │   └── handler.py            # API Gateway JWT gatekeeper & execution polling lifecycle
 │   ├── shared/
-│   │   ├── config.py             # Strongly typed pydantic environment settings
+│   │   ├── config.py             # Strongly typed application environment settings
 │   │   ├── opensearch_index.py   # Explicit 1,024-dim HNSW k-NN index schema & bootstrapper
-│   │   ├── telemetry.py          # OpenTelemetry GenAI spans & FinOps cost calculation
+│   │   ├── telemetry.py          # OpenTelemetry GenAI spans & CloudWatch EMF FinOps metrics
 │   │   └── tenant_context.py     # HMAC-SHA256 cryptographic tenant sealing & verification
 │   ├── orchestrator/
-│   │   ├── claude_client.py      # Bedrock Converse API client with Sonnet -> Haiku fallback
-│   │   ├── handler.py            # Dual-mode Lambda worker (INFERENCE / TOOL_EXECUTION)
+│   │   ├── __init__.py
+│   │   ├── handler.py            # Step Functions inference & tool execution loop worker
+│   │   ├── claude_client.py      # Bedrock Converse client with Converse-level tool calling
 │   │   └── tools/
-│   │       ├── base.py           # Abstract BaseTool with JSON schema generation
-│   │       ├── rag_retriever.py  # OpenSearch Serverless hybrid BM25 + kNN retrieval
-│   │       └── calculator.py     # Deterministic Python AST safe arithmetic evaluator
+│   │       ├── base.py           # Abstract BaseTool contract with JSON schema export
+│   │       ├── calculator.py     # AST-parsed deterministic math calculator
+│   │       └── rag_retriever.py  # OpenSearch Serverless vector + BM25 hybrid retriever
 │   └── ingestion/
-│       ├── chunker.py            # Sliding-window document chunking with overlap
-│       └── handler.py            # S3 upload event worker & vector index bootstrapper
+│       ├── __init__.py
+│       ├── handler.py            # S3 event listener (Titan Embeddings v2 vector indexing)
+│       └── chunker.py            # Markdown-aware structural text chunker
 ├── tests/
-│   └── test_security_and_isolation.py # Unit tests for HMAC tenant isolation & schema validation
+│   ├── test_security_and_isolation.py         # Unit tests for HMAC tenant isolation & schema
+│   └── test_execution_lifecycle_and_telemetry.py # Unit tests for polling, IDOR defense & EMF metrics
 └── terraform/
     ├── main.tf                   # Root deployment module wiring all subsystems & VPC endpoints
     ├── variables.tf              # Configurable project variables & model IDs
     ├── outputs.tf                # Exported ARNs, API Gateway endpoints, and dashboard identifiers
     ├── versions.tf               # Terraform core and AWS provider version constraints
     ├── terraform.tfvars.example  # Production-ready configuration baseline
+    ├── backend.tf.example        # S3 remote state configuration with DynamoDB locking
     └── modules/
         ├── security_kms_iam/     # Customer Managed Key (CMK) and key policies
         ├── opensearch_serverless/# Serverless collection, private VPCE, CMK encryption & data policies
@@ -192,6 +218,7 @@ Rather than sharing a single broad execution role across services, the architect
 | [ADR-0002](docs/adr/0002-opensearch-serverless-vs-pgvector.md) | OpenSearch Serverless vs. Amazon Aurora pgvector | Selected OpenSearch Serverless for combined BM25 keyword matching and dense vector search without database maintenance overhead. |
 | [ADR-0003](docs/adr/0003-step-functions-vs-in-memory-loops.md) | Step Functions vs. In-Memory Agent Loops | Externalize agent control flow to Step Functions to bypass Lambda 15-minute limits, avoid runaway token burn, and capture auditable state. |
 | [ADR-0004](docs/adr/0004-cryptographic-tenant-isolation-and-iam-separation.md) | Cryptographic Tenant Isolation & IAM Separation | Bind tenant identity via JWT authorizers and HMAC-SHA256 signatures; enforce S3 key prefixes and decompose Lambda execution roles. |
+| [ADR-0005](docs/adr/0005-dependency-layering-async-delivery-and-state-security.md) | Layering, Async Delivery & State Security | Automate opensearch-py Lambda layer; deliver async responses via polling route with IDOR isolation; eliminate secrets from Terraform state. |
 
 ---
 
@@ -216,7 +243,7 @@ terraform init
 terraform plan -out=tfplan
 terraform apply tfplan
 ```
-*Terraform deploys the VPC, OpenSearch Serverless collection, KMS CMK, Bedrock Guardrails, Step Functions state machine, and automatically triggers the index bootstrapper to initialize the 1,024-dim vector mapping.*
+*Terraform packages the `opensearch-py` Lambda Layer, provisions the VPC, OpenSearch Serverless collection, KMS CMK, Bedrock Guardrails, and Step Functions state machine, and automatically triggers the index bootstrapper to initialize the 1,024-dim vector mapping.*
 
 ### 3. Ingest Enterprise Documents Under Tenant Prefix
 Upload documents into the tenant-specific S3 key prefix:
@@ -228,26 +255,58 @@ aws s3 cp sample-failover-policy.md s3://${DOCS_BUCKET}/tenants/engineering-dept
 ```
 The Ingestion Lambda validates the `tenants/engineering-dept/` prefix, extracts passages, generates 1,024-dim Titan v2 embeddings, and indexes chunks tagged with `tenant_id: "engineering-dept"`.
 
-### 4. Execute an Authenticated Agentic Query
+### 4. End-to-End Query & Result Polling Lifecycle
+
+#### Step 4a: Start Asynchronous Agent Execution
 Call the authenticated HTTP API with a valid Cognito/OIDC JWT Bearer token:
 ```bash
 API_ENDPOINT=$(terraform output -raw api_gateway_endpoint)
 BEARER_TOKEN="<VALID_COGNITO_JWT_TOKEN>"
 
-curl -X POST "${API_ENDPOINT}" \
+START_RESP=$(curl -s -X POST "${API_ENDPOINT}" \
   -H "Authorization: Bearer ${BEARER_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "What is our company policy on multi-region failover, and what would be the total annual cost if our monthly bill is $14,500?"
-  }'
+  }')
+
+echo "${START_RESP}"
+# Output:
+# {"status": "ACCEPTED", "execution_arn": "...", "execution_id": "c888e21a-...", "tenant_id": "engineering-dept", "poll_url": "/v1/agent/executions/c888e21a-..."}
+
+EXECUTION_ID=$(echo "${START_RESP}" | jq -r '.execution_id')
 ```
-The API Gateway authorizer verifies the JWT, the Gatekeeper seals the `custom:tenant_id` claim, and the Step Functions state machine executes the autonomous reasoning loop with strictly isolated hybrid RAG retrieval.
+
+#### Step 4b: Poll for Completion and Retrieve Answer
+Poll the execution endpoint with the authenticated Bearer token:
+```bash
+POLL_ENDPOINT=$(terraform output -raw api_gateway_poll_endpoint | sed "s/{execution_id}/${EXECUTION_ID}/")
+
+curl -s -X GET "${POLL_ENDPOINT}" \
+  -H "Authorization: Bearer ${BEARER_TOKEN}" | jq .
+```
+When complete, the API returns the verified assistant response, reasoning iterations, and OpenTelemetry FinOps telemetry:
+```json
+{
+  "status": "SUCCEEDED",
+  "execution_id": "c888e21a-...",
+  "tenant_id": "engineering-dept",
+  "final_response": "According to the Engineering Multi-Region Failover Policy (DOC-482), secondary regions must achieve RTO < 15 minutes. For an ongoing monthly cloud spend of $14,500, the projected annual baseline cost is $174,000.00.",
+  "iterations": 2,
+  "telemetry": {
+    "gen_ai.system": "aws.bedrock",
+    "gen_ai.request.model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    "gen_ai.usage.estimated_cost_usd": 0.0078,
+    "gen_ai.usage.total_tokens": 1420
+  }
+}
+```
 
 ---
 
 ## Running Unit Tests
 
-Run the security and schema validation suite locally:
+Run the security, schema validation, and execution lifecycle suite locally:
 ```bash
 python3 -m unittest discover tests
 ```

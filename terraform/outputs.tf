@@ -8,6 +8,11 @@ output "api_gateway_endpoint" {
   value       = "${aws_apigatewayv2_api.agent_api.api_endpoint}/v1/agent/executions"
 }
 
+output "api_gateway_poll_endpoint" {
+  description = "Authenticated HTTP API route template for polling execution results."
+  value       = "${aws_apigatewayv2_api.agent_api.api_endpoint}/v1/agent/executions/{execution_id}"
+}
+
 output "cognito_user_pool_id" {
   description = "Cognito User Pool ID governing tenant identity (`custom:tenant_id` claim)."
   value       = aws_cognito_user_pool.tenant_identity_pool.id
@@ -26,6 +31,11 @@ output "opensearch_collection_arn" {
 output "opensearch_vpc_endpoint_id" {
   description = "Private Interface VPC Endpoint ID for OpenSearch Serverless (`AllowFromPublic = false`)."
   value       = module.opensearch_serverless.vpc_endpoint_id
+}
+
+output "opensearch_dependencies_layer_arn" {
+  description = "Lambda Layer ARN providing opensearch-py and requests-aws4auth dependencies."
+  value       = aws_lambda_layer_version.opensearch_dependencies.arn
 }
 
 output "bedrock_guardrail_arn" {

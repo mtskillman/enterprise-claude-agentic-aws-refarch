@@ -22,21 +22,17 @@ module "security" {
   tags         = var.tags
 }
 
-resource "random_password" "tenant_hmac_key" {
-  length  = 64
-  special = false
-}
-
+# Zero-Trust State Hygiene:
+# The secret container is declared with KMS CMK encryption, but the plaintext key
+# is NEVER stored or generated in Terraform state. The Gatekeeper Lambda auto-seeds
+# the 256-bit secret directly into AWS Secrets Manager upon first run, or operators
+# seed/rotate it out-of-band using scripts/seed_hmac_secret.sh.
 resource "aws_secretsmanager_secret" "tenant_context_hmac" {
-  name        = "${var.project_name}-${var.environment}-tenant-hmac-secret"
-  description = "HMAC-SHA256 signing key used to cryptographically seal verified tenant identity contexts"
-  kms_key_id  = module.security.kms_key_arn
-  tags        = var.tags
-}
-
-resource "aws_secretsmanager_secret_version" "tenant_context_hmac_val" {
-  secret_id     = aws_secretsmanager_secret.tenant_context_hmac.id
-  secret_string = random_password.tenant_hmac_key.result
+  name                    = "${var.project_name}-${var.environment}-tenant-hmac-secret"
+  description             = "HMAC-SHA256 signing key used to cryptographically seal verified tenant identity contexts"
+  kms_key_id              = module.security.kms_key_arn
+  recovery_window_in_days = 0
+  tags                    = var.tags
 }
 
 # ==============================================================================
@@ -384,26 +380,32 @@ resource "aws_iam_role_policy" "auth_gatekeeper_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "StartAgentStateMachine"
+        Sid    = "ManageAgentStateMachineExecution"
         Effect = "Allow"
         Action = [
-          "states:StartExecution"
+          "states:StartExecution",
+          "states:DescribeExecution"
         ]
-        Resource = [module.orchestrator_step_functions.state_machine_arn]
+        Resource = [
+          module.orchestrator_step_functions.state_machine_arn,
+          "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:execution:${var.project_name}-orchestrator:*"
+        ]
       },
       {
-        Sid    = "ReadTenantContextHMACSecret"
+        Sid    = "ManageTenantContextHMACSecret"
         Effect = "Allow"
         Action = [
-          "secretsmanager:GetSecretValue"
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:PutSecretValue"
         ]
         Resource = [aws_secretsmanager_secret.tenant_context_hmac.arn]
       },
       {
-        Sid    = "KMSDecryptSecret"
+        Sid    = "KMSDecryptAndGenerateSecret"
         Effect = "Allow"
         Action = [
-          "kms:Decrypt"
+          "kms:Decrypt",
+          "kms:GenerateDataKey"
         ]
         Resource = [module.security.kms_key_arn]
       }
@@ -443,8 +445,37 @@ module "bedrock_agent" {
 }
 
 # ==============================================================================
-# 7. Lambda Functions (Orchestrator, Ingestion, & Auth Gatekeeper)
+# 7. Lambda Dependency Layer & Functions (Orchestrator, Ingestion, & Gatekeeper)
 # ==============================================================================
+
+# Lambda Layer Packaging: opensearch-py, requests-aws4auth, and requests
+resource "null_resource" "build_lambda_dependencies" {
+  triggers = {
+    requirements_hash = filemd5("${path.module}/../requirements.txt")
+    script_hash       = filemd5("${path.module}/../scripts/build_layer.sh")
+  }
+
+  provisioner "local-exec" {
+    command = "bash ${path.module}/../scripts/build_layer.sh"
+  }
+}
+
+data "archive_file" "layer_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/build/layer"
+  output_path = "${path.module}/build/layer.zip"
+
+  depends_on = [null_resource.build_lambda_dependencies]
+}
+
+resource "aws_lambda_layer_version" "opensearch_dependencies" {
+  filename            = data.archive_file.layer_zip.output_path
+  layer_name          = "${var.project_name}-opensearch-dependencies"
+  compatible_runtimes = ["python3.11"]
+  source_code_hash    = data.archive_file.layer_zip.output_base64sha256
+  description         = "Runtime dependencies: opensearch-py 2.8.0, requests-aws4auth 1.3.1, requests"
+}
+
 data "archive_file" "runtime_zip" {
   type        = "zip"
   source_dir  = "${path.module}/../src"
@@ -460,6 +491,7 @@ resource "aws_lambda_function" "orchestrator" {
   timeout          = 300
   memory_size      = 1024
   source_code_hash = data.archive_file.runtime_zip.output_base64sha256
+  layers           = [aws_lambda_layer_version.opensearch_dependencies.arn]
 
   vpc_config {
     subnet_ids         = [aws_subnet.private_a.id, aws_subnet.private_b.id]
@@ -496,6 +528,7 @@ resource "aws_lambda_function" "ingestion" {
   timeout          = 180
   memory_size      = 512
   source_code_hash = data.archive_file.runtime_zip.output_base64sha256
+  layers           = [aws_lambda_layer_version.opensearch_dependencies.arn]
 
   vpc_config {
     subnet_ids         = [aws_subnet.private_a.id, aws_subnet.private_b.id]
@@ -527,7 +560,8 @@ resource "aws_lambda_invocation" "bootstrap_vector_index" {
   })
 
   depends_on = [
-    module.opensearch_serverless
+    module.opensearch_serverless,
+    aws_lambda_layer_version.opensearch_dependencies
   ]
 }
 
@@ -657,6 +691,14 @@ resource "aws_apigatewayv2_route" "start_execution_route" {
   target             = "integrations/${aws_apigatewayv2_integration.gatekeeper_integration.id}"
 }
 
+resource "aws_apigatewayv2_route" "get_execution_route" {
+  api_id             = aws_apigatewayv2_api.agent_api.id
+  route_key          = "GET /v1/agent/executions/{execution_id}"
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.gatekeeper_integration.id}"
+}
+
 resource "aws_apigatewayv2_stage" "default" {
   api_id      = aws_apigatewayv2_api.agent_api.id
   name        = "$default"
@@ -679,6 +721,7 @@ module "observability" {
   source       = "./modules/observability_adot"
   project_name = var.project_name
   environment  = var.environment
+  aws_region   = var.aws_region
   kms_key_arn  = module.security.kms_key_arn
   tags         = var.tags
 }
