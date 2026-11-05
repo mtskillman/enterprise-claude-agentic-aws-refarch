@@ -9,6 +9,8 @@ import boto3
 from opensearchpy import AWSV4SignerAuth, OpenSearch, RequestsHttpConnection
 
 from ...shared.config import AppConfig
+from ...shared.opensearch_index import EMBEDDING_DIMENSIONS
+from ...shared.tenant_context import VerifiedTenantContext
 from .base import BaseTool
 
 
@@ -59,8 +61,14 @@ class OpenSearchRAGRetrieverTool(BaseTool):
         )
 
     def _generate_embedding(self, text: str) -> list[float]:
-        """Generate 1024-dimension vector embedding via Amazon Titan Embeddings v2."""
-        payload = json.dumps({"inputText": text, "dimensions": 1024, "normalize": True})
+        """Generate 1,024-dimension vector embedding via Amazon Titan Text Embeddings v2."""
+        payload = json.dumps(
+            {
+                "inputText": text,
+                "dimensions": EMBEDDING_DIMENSIONS,
+                "normalize": True,
+            }
+        )
         response = self.bedrock_runtime.invoke_model(
             modelId=self.config.embedding_model_id,
             contentType="application/json",
@@ -70,23 +78,30 @@ class OpenSearchRAGRetrieverTool(BaseTool):
         result = json.loads(response["body"].read())
         return result["embedding"]
 
-    def execute(self, arguments: Dict[str, Any], tenant_id: str = "default") -> Dict[str, Any]:
+    def execute(self, arguments: Dict[str, Any], tenant_id: str) -> Dict[str, Any]:
+        # Enforce strict tenant_id validation (never fall back to a shared default)
+        VerifiedTenantContext.validate_tenant_id_format(tenant_id)
+
         query_text = arguments["query"]
-        top_k = arguments.get("top_k", 5)
+        top_k = int(arguments.get("top_k", 5))
         query_vector = self._generate_embedding(query_text)
 
-        # Hybrid query: k-NN vector matching + BM25 keyword matching with tenant isolation
+        tenant_filter = {"term": {"tenant_id": tenant_id}}
+
+        # Hybrid query: HNSW k-NN pre-filtered vector search + BM25 lexical search
+        # with mandatory tenant_id partition isolation and minimum_should_match=1.
         search_query = {
             "size": top_k,
             "query": {
                 "bool": {
-                    "filter": [{"term": {"tenant_id.keyword": tenant_id}}],
+                    "filter": [tenant_filter],
                     "should": [
                         {
                             "knn": {
                                 "embedding": {
                                     "vector": query_vector,
                                     "k": top_k,
+                                    "filter": tenant_filter,
                                 }
                             }
                         },
@@ -97,6 +112,7 @@ class OpenSearchRAGRetrieverTool(BaseTool):
                             }
                         },
                     ],
+                    "minimum_should_match": 1,
                 }
             },
         }

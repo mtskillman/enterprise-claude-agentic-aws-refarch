@@ -3,14 +3,29 @@ output "kms_key_arn" {
   value       = module.security.kms_key_arn
 }
 
+output "api_gateway_endpoint" {
+  description = "Authenticated HTTP API endpoint for starting tenant-bound agent executions."
+  value       = "${aws_apigatewayv2_api.agent_api.api_endpoint}/v1/agent/executions"
+}
+
+output "cognito_user_pool_id" {
+  description = "Cognito User Pool ID governing tenant identity (`custom:tenant_id` claim)."
+  value       = aws_cognito_user_pool.tenant_identity_pool.id
+}
+
 output "opensearch_collection_endpoint" {
-  description = "OpenSearch Serverless Vector Collection endpoint."
+  description = "OpenSearch Serverless Vector Collection private endpoint."
   value       = module.opensearch_serverless.collection_endpoint
 }
 
 output "opensearch_collection_arn" {
   description = "OpenSearch Serverless Vector Collection ARN."
   value       = module.opensearch_serverless.collection_arn
+}
+
+output "opensearch_vpc_endpoint_id" {
+  description = "Private Interface VPC Endpoint ID for OpenSearch Serverless (`AllowFromPublic = false`)."
+  value       = module.opensearch_serverless.vpc_endpoint_id
 }
 
 output "bedrock_guardrail_arn" {
@@ -29,13 +44,18 @@ output "step_functions_state_machine_arn" {
 }
 
 output "knowledge_bucket_name" {
-  description = "S3 bucket for document ingestion and vector indexing."
+  description = "S3 bucket for document ingestion (`s3://<bucket>/tenants/<tenant_id>/...`)."
   value       = aws_s3_bucket.knowledge_documents.bucket
 }
 
 output "orchestrator_lambda_arn" {
-  description = "Orchestrator Lambda Function ARN."
+  description = "Orchestrator Lambda Function ARN (Read-Only AOSS search, zero S3 access)."
   value       = aws_lambda_function.orchestrator.arn
+}
+
+output "ingestion_lambda_arn" {
+  description = "Ingestion & Index Bootstrapper Lambda Function ARN (Titan Embed v2 & AOSS write)."
+  value       = aws_lambda_function.ingestion.arn
 }
 
 output "telemetry_dashboard_name" {

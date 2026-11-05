@@ -1,5 +1,5 @@
 {
-  "Comment": "Enterprise Claude Agentic Loop State Machine on AWS",
+  "Comment": "Enterprise Claude Agentic Loop State Machine on AWS with Cryptographic Tenant Context Propagation",
   "StartAt": "ClaudeInferenceTurn",
   "States": {
     "ClaudeInferenceTurn": {
@@ -9,7 +9,7 @@
         "FunctionName": "${AgentLambdaArn}",
         "Payload": {
           "action": "INFERENCE",
-          "tenant_id.$": "$.tenant_id",
+          "auth_context.$": "$.auth_context",
           "messages.$": "$.messages",
           "iteration.$": "$.iteration"
         }
@@ -19,9 +19,9 @@
         "has_tool_use.$": "$.Payload.has_tool_use",
         "tool_requests.$": "$.Payload.tool_requests",
         "messages.$": "$.Payload.messages",
+        "auth_context.$": "$.Payload.auth_context",
         "iteration.$": "$.Payload.iteration",
-        "telemetry.$": "$.Payload.telemetry",
-        "tenant_id.$": "$.Payload.telemetry.tenant.id"
+        "telemetry.$": "$.Payload.telemetry"
       },
       "ResultPath": "$",
       "Retry": [
@@ -59,13 +59,13 @@
           "action": "TOOL_EXECUTION",
           "tool_requests.$": "$.tool_requests",
           "messages.$": "$.messages",
-          "tenant_id.$": "$.tenant_id",
+          "auth_context.$": "$.auth_context",
           "iteration.$": "$.iteration"
         }
       },
       "ResultSelector": {
         "messages.$": "$.Payload.messages",
-        "tenant_id.$": "$.Payload.tenant_id",
+        "auth_context.$": "$.Payload.auth_context",
         "iteration.$": "$.Payload.iteration"
       },
       "ResultPath": "$",

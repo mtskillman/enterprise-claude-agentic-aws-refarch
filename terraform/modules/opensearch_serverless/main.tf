@@ -1,6 +1,16 @@
-data "aws_caller_identity" "current" {}
+# ==============================================================================
+# OpenSearch Serverless Interface VPC Endpoint (Private Network Isolation)
+# ==============================================================================
+resource "aws_opensearchserverless_vpc_endpoint" "aoss_vpce" {
+  name               = "${var.project_name}-vpce"
+  vpc_id             = var.vpc_id
+  subnet_ids         = var.private_subnet_ids
+  security_group_ids = var.vpce_security_group_ids
+}
 
-# OpenSearch Serverless Security Encryption Policy
+# ==============================================================================
+# OpenSearch Serverless Encryption Policy (Customer Managed KMS Key)
+# ==============================================================================
 resource "aws_opensearchserverless_security_policy" "encryption" {
   name = "${var.project_name}-enc"
   type = "encryption"
@@ -14,11 +24,14 @@ resource "aws_opensearchserverless_security_policy" "encryption" {
         ]
       }
     ]
-    AWSOwnedKey = true
+    AWSOwnedKey = false
+    KmsARN      = var.kms_key_arn
   })
 }
 
-# OpenSearch Serverless Network Policy (VPC/Public with strict auth)
+# ==============================================================================
+# OpenSearch Serverless Network Policy (Strictly Private via VPC Endpoint)
+# ==============================================================================
 resource "aws_opensearchserverless_security_policy" "network" {
   name = "${var.project_name}-net"
   type = "network"
@@ -39,15 +52,20 @@ resource "aws_opensearchserverless_security_policy" "network" {
           ]
         }
       ]
-      AllowFromPublic = true
+      AllowFromPublic = false
+      SourceVPCEs = [
+        aws_opensearchserverless_vpc_endpoint.aoss_vpce.id
+      ]
     }
   ])
 }
 
+# ==============================================================================
 # OpenSearch Serverless Vector Collection
+# ==============================================================================
 resource "aws_opensearchserverless_collection" "knowledge_base" {
   name        = "${var.project_name}-kb"
-  description = "Authoritative enterprise vector search knowledge base for Claude agent retrieval"
+  description = "Authoritative enterprise vector search knowledge base (1,024-dim HNSW + BM25)"
   type        = "VECTORSEARCH"
 
   depends_on = [
@@ -60,14 +78,17 @@ resource "aws_opensearchserverless_collection" "knowledge_base" {
   })
 }
 
-# OpenSearch Serverless Data Access Policy
+# ==============================================================================
+# OpenSearch Serverless Data Access Policy (Separated Read vs. Write Principals)
+# ==============================================================================
 resource "aws_opensearchserverless_access_policy" "data_access" {
   name        = "${var.project_name}-access"
   type        = "data"
-  description = "Allows Lambda ingest and agent orchestrator to perform vector indexing and hybrid search"
+  description = "Least-privilege separation: Ingestion role writes/creates index; Orchestrator role has read-only search access"
 
   policy = jsonencode([
     {
+      Description = "Ingestion Worker: Index creation and document indexing permissions"
       Rules = [
         {
           ResourceType = "index"
@@ -78,7 +99,6 @@ resource "aws_opensearchserverless_access_policy" "data_access" {
             "aoss:CreateIndex",
             "aoss:UpdateIndex",
             "aoss:DescribeIndex",
-            "aoss:ReadDocument",
             "aoss:WriteDocument"
           ]
         },
@@ -95,8 +115,34 @@ resource "aws_opensearchserverless_access_policy" "data_access" {
         }
       ]
       Principal = [
-        var.lambda_execution_role_arn,
-        "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        var.ingestion_role_arn
+      ]
+    },
+    {
+      Description = "Orchestrator Agent: Strictly read-only hybrid k-NN and BM25 search permissions"
+      Rules = [
+        {
+          ResourceType = "index"
+          Resource = [
+            "index/${var.project_name}-kb/*"
+          ]
+          Permission = [
+            "aoss:DescribeIndex",
+            "aoss:ReadDocument"
+          ]
+        },
+        {
+          ResourceType = "collection"
+          Resource = [
+            "collection/${var.project_name}-kb"
+          ]
+          Permission = [
+            "aoss:DescribeCollectionItems"
+          ]
+        }
+      ]
+      Principal = [
+        var.orchestrator_role_arn
       ]
     }
   ])

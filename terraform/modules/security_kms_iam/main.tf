@@ -20,6 +20,28 @@ resource "aws_kms_key" "genai_key" {
         Resource = "*"
       },
       {
+        Sid    = "AllowOpenSearchServerlessCMKEncryption"
+        Effect = "Allow"
+        Principal = {
+          Service = "aoss.amazonaws.com"
+        }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:CreateGrant",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "kms:ViaService"    = "aoss.${data.aws_region.current.name}.amazonaws.com"
+            "kms:CallerAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      },
+      {
         Sid    = "AllowCloudWatchLogs"
         Effect = "Allow"
         Principal = {

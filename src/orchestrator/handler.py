@@ -1,16 +1,25 @@
 """Step Functions Agentic Worker Lambda Handler.
 
 Handles dual execution modes within the Step Functions state machine:
-1. 'INFERENCE': Invocates Anthropic Claude on Amazon Bedrock with tools.
+1. 'INFERENCE': Invokes Anthropic Claude on Amazon Bedrock with tools.
 2. 'TOOL_EXECUTION': Dispatches tool calls requested by Claude and returns results.
+
+Tenant Isolation:
+Every invocation requires a cryptographically signed `auth_context` minted by the
+ingress authorizer (`VerifiedTenantContext`). Unverified or caller-supplied
+`tenant_id` overrides are rejected with `TenantIsolationError`.
 """
 
 from __future__ import annotations
 
-import json
+import functools
 import logging
 from typing import Any, Dict
 
+import boto3
+
+from ..shared.config import AppConfig
+from ..shared.tenant_context import TenantIsolationError, VerifiedTenantContext
 from .claude_client import ClaudeBedrockClient
 from .tools.calculator import SafeCalculatorTool
 from .tools.rag_retriever import OpenSearchRAGRetrieverTool
@@ -26,14 +35,37 @@ Be concise, authoritative, and cite specific documentation IDs when retrieved.
 """
 
 
+@functools.lru_cache(maxsize=1)
+def _get_signing_secret(secret_arn: str, region: str) -> str:
+    """Retrieve the HMAC signing key from AWS Secrets Manager (cached per execution environment)."""
+    sm_client = boto3.client("secretsmanager", region_name=region)
+    resp = sm_client.get_secret_value(SecretId=secret_arn)
+    return resp["SecretString"]
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    config = AppConfig()
     action = event.get("action", "INFERENCE")
-    tenant_id = event.get("tenant_id", "default")
     messages = event.get("messages", [])
     iteration = event.get("iteration", 0)
 
+    # Verify cryptographic tenant identity seal minted by the Ingress Gatekeeper
+    signing_secret = _get_signing_secret(
+        config.tenant_context_secret_arn, config.aws_region
+    )
+    verified_ctx = VerifiedTenantContext.from_untrusted_dict(
+        event.get("auth_context"), signing_secret=signing_secret
+    )
+    tenant_id = verified_ctx.tenant_id
+
+    # Guard against any top-level payload tenant_id tampering
+    if "tenant_id" in event and event["tenant_id"] != tenant_id:
+        raise TenantIsolationError(
+            f"Payload tenant_id '{event['tenant_id']}' does not match verified auth_context tenant '{tenant_id}'."
+        )
+
     # Initialize tools
-    rag_tool = OpenSearchRAGRetrieverTool()
+    rag_tool = OpenSearchRAGRetrieverTool(config=config)
     calc_tool = SafeCalculatorTool()
     tool_map = {
         rag_tool.name: rag_tool,
@@ -41,7 +73,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     }
 
     if action == "INFERENCE":
-        client = ClaudeBedrockClient()
+        client = ClaudeBedrockClient(config=config)
         turn_result = client.generate_turn(
             messages=messages,
             system_prompt=SYSTEM_PROMPT,
@@ -65,6 +97,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "has_tool_use": has_tool_use,
             "tool_requests": tool_requests,
             "messages": messages,
+            "auth_context": verified_ctx.to_dict(),
             "iteration": iteration + 1,
             "telemetry": turn_result["telemetry"],
         }
@@ -99,7 +132,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return {
             "action": "INFERENCE",
             "messages": messages,
-            "tenant_id": tenant_id,
+            "auth_context": verified_ctx.to_dict(),
             "iteration": iteration,
         }
 

@@ -50,6 +50,13 @@ class ClaudeBedrockClient:
         if tool_config:
             params["toolConfig"] = tool_config
 
+        if self.config.bedrock_guardrail_id:
+            params["guardrailConfig"] = {
+                "guardrailIdentifier": self.config.bedrock_guardrail_id,
+                "guardrailVersion": self.config.bedrock_guardrail_version,
+                "trace": "enabled",
+            }
+
         try:
             response = self.client.converse(**params)
         except ClientError as err:

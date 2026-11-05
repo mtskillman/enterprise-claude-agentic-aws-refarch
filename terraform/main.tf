@@ -1,7 +1,3 @@
-terraform {
-  required_version = ">= 1.5.0"
-}
-
 provider "aws" {
   region = var.aws_region
 
@@ -12,9 +8,12 @@ provider "aws" {
 
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
+data "aws_availability_zones" "available" {
+  state = "available"
+}
 
 # ==============================================================================
-# Security & KMS
+# 1. Security & KMS Customer Managed Key (CMK)
 # ==============================================================================
 module "security" {
   source       = "./modules/security_kms_iam"
@@ -23,8 +22,137 @@ module "security" {
   tags         = var.tags
 }
 
+resource "random_password" "tenant_hmac_key" {
+  length  = 64
+  special = false
+}
+
+resource "aws_secretsmanager_secret" "tenant_context_hmac" {
+  name        = "${var.project_name}-${var.environment}-tenant-hmac-secret"
+  description = "HMAC-SHA256 signing key used to cryptographically seal verified tenant identity contexts"
+  kms_key_id  = module.security.kms_key_arn
+  tags        = var.tags
+}
+
+resource "aws_secretsmanager_secret_version" "tenant_context_hmac_val" {
+  secret_id     = aws_secretsmanager_secret.tenant_context_hmac.id
+  secret_string = random_password.tenant_hmac_key.result
+}
+
 # ==============================================================================
-# Document Ingestion Storage (S3)
+# 2. Private VPC & Zero-Trust Network Isolation
+# ==============================================================================
+resource "aws_vpc" "genai_vpc" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-vpc"
+  })
+}
+
+resource "aws_subnet" "private_a" {
+  vpc_id                  = aws_vpc.genai_vpc.id
+  cidr_block              = cidrsubnet(var.vpc_cidr, 8, 1)
+  availability_zone       = data.aws_availability_zones.available.names[0]
+  map_public_ip_on_launch = false
+
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-private-subnet-a"
+  })
+}
+
+resource "aws_subnet" "private_b" {
+  vpc_id                  = aws_vpc.genai_vpc.id
+  cidr_block              = cidrsubnet(var.vpc_cidr, 8, 2)
+  availability_zone       = data.aws_availability_zones.available.names[1]
+  map_public_ip_on_launch = false
+
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-private-subnet-b"
+  })
+}
+
+resource "aws_route_table" "private_rt" {
+  vpc_id = aws_vpc.genai_vpc.id
+  tags = merge(var.tags, {
+    Name = "${var.project_name}-private-rt"
+  })
+}
+
+resource "aws_route_table_association" "private_a" {
+  subnet_id      = aws_subnet.private_a.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+resource "aws_route_table_association" "private_b" {
+  subnet_id      = aws_subnet.private_b.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+resource "aws_security_group" "lambda_sg" {
+  name        = "${var.project_name}-lambda-sg"
+  description = "Security group for private VPC GenAI Lambda functions"
+  vpc_id      = aws_vpc.genai_vpc.id
+
+  egress {
+    description = "Allow HTTPS egress to private VPC endpoints and S3 gateway"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = var.tags
+}
+
+resource "aws_security_group" "vpce_sg" {
+  name        = "${var.project_name}-vpce-sg"
+  description = "Security group for OpenSearch Serverless and AWS PrivateLink VPC Endpoints"
+  vpc_id      = aws_vpc.genai_vpc.id
+
+  ingress {
+    description     = "Allow HTTPS strictly from GenAI Lambda execution security group"
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.lambda_sg.id]
+  }
+
+  tags = var.tags
+}
+
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.genai_vpc.id
+  service_name      = "com.amazonaws.${var.aws_region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.private_rt.id]
+  tags              = var.tags
+}
+
+resource "aws_vpc_endpoint" "bedrock_runtime" {
+  vpc_id              = aws_vpc.genai_vpc.id
+  service_name        = "com.amazonaws.${var.aws_region}.bedrock-runtime"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+  security_group_ids  = [aws_security_group.vpce_sg.id]
+  private_dns_enabled = true
+  tags                = var.tags
+}
+
+resource "aws_vpc_endpoint" "secretsmanager" {
+  vpc_id              = aws_vpc.genai_vpc.id
+  service_name        = "com.amazonaws.${var.aws_region}.secretsmanager"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+  security_group_ids  = [aws_security_group.vpce_sg.id]
+  private_dns_enabled = true
+  tags                = var.tags
+}
+
+# ==============================================================================
+# 3. Document Ingestion Storage (S3 with Tenant Prefix Enforcement)
 # ==============================================================================
 resource "aws_s3_bucket" "knowledge_documents" {
   bucket        = "${var.project_name}-docs-${data.aws_caller_identity.current.account_id}"
@@ -50,6 +178,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "knowledge_documen
       kms_master_key_id = module.security.kms_key_arn
       sse_algorithm     = "aws:kms"
     }
+    bucket_key_enabled = true
   }
 }
 
@@ -62,13 +191,50 @@ resource "aws_s3_bucket_public_access_block" "knowledge_documents" {
   restrict_public_buckets = true
 }
 
-# ==============================================================================
-# Lambda Execution Roles & IAM Policies
-# ==============================================================================
-resource "aws_iam_role" "lambda_exec" {
-  name = "${var.project_name}-lambda-exec-role"
+resource "aws_s3_bucket_policy" "tenant_prefix_isolation" {
+  bucket = aws_s3_bucket.knowledge_documents.id
 
-  assume_role_policy = jsonencode({
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DenyNonTLSRequests"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource = [
+          aws_s3_bucket.knowledge_documents.arn,
+          "${aws_s3_bucket.knowledge_documents.arn}/*"
+        ]
+        Condition = {
+          Bool = {
+            "aws:SecureTransport" = "false"
+          }
+        }
+      },
+      {
+        Sid       = "DenyUploadsOutsidePrincipalTenantPrefix"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        NotResource = [
+          "${aws_s3_bucket.knowledge_documents.arn}/tenants/$${aws:PrincipalTag/tenant_id}/*"
+        ]
+        Condition = {
+          StringNotEquals = {
+            "aws:PrincipalArn" = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+          }
+        }
+      }
+    ]
+  })
+}
+
+# ==============================================================================
+# 4. Separated Least-Privilege IAM Execution Roles
+# ==============================================================================
+locals {
+  assume_lambda_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
@@ -78,32 +244,38 @@ resource "aws_iam_role" "lambda_exec" {
       }
     ]
   })
-
-  tags = var.tags
 }
 
-resource "aws_iam_policy" "lambda_genai_policy" {
-  name        = "${var.project_name}-lambda-genai-policy"
-  description = "Permissions for Claude Bedrock, OpenSearch Serverless, S3, and KMS"
+# 4a. Orchestrator Query Role (Bedrock Claude/Titan + Read-Only AOSS; ZERO S3 access)
+resource "aws_iam_role" "orchestrator_exec" {
+  name               = "${var.project_name}-orchestrator-role"
+  assume_role_policy = local.assume_lambda_policy
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy" "orchestrator_policy" {
+  name = "${var.project_name}-orchestrator-least-privilege"
+  role = aws_iam_role.orchestrator_exec.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "BedrockModelInvocation"
+        Sid    = "BedrockClaudeAndQueryEmbeddingInvocation"
         Effect = "Allow"
         Action = [
           "bedrock:InvokeModel",
-          "bedrock:InvokeModelWithResponseStream",
           "bedrock:ApplyGuardrail"
         ]
         Resource = [
-          "arn:aws:bedrock:${var.aws_region}::foundation-model/*",
+          "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.primary_claude_model_id}",
+          "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.fallback_claude_model_id}",
+          "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.embedding_model_id}",
           module.bedrock_agent.guardrail_arn
         ]
       },
       {
-        Sid    = "OpenSearchServerlessAccess"
+        Sid    = "OpenSearchServerlessCollectionEndpointAccess"
         Effect = "Allow"
         Action = [
           "aoss:APIAccessAll"
@@ -111,69 +283,157 @@ resource "aws_iam_policy" "lambda_genai_policy" {
         Resource = [module.opensearch_serverless.collection_arn]
       },
       {
-        Sid    = "S3DocumentAccess"
+        Sid    = "VerifyTenantContextHMACSecret"
         Effect = "Allow"
         Action = [
-          "s3:GetObject",
-          "s3:PutObject",
-          "s3:ListBucket"
+          "secretsmanager:GetSecretValue"
         ]
-        Resource = [
-          aws_s3_bucket.knowledge_documents.arn,
-          "${aws_s3_bucket.knowledge_documents.arn}/*"
-        ]
+        Resource = [aws_secretsmanager_secret.tenant_context_hmac.arn]
       },
       {
-        Sid    = "KMSAccess"
+        Sid    = "KMSDecryptOnly"
         Effect = "Allow"
         Action = [
           "kms:Decrypt",
-          "kms:GenerateDataKey",
           "kms:DescribeKey"
         ]
         Resource = [module.security.kms_key_arn]
-      },
-      {
-        Sid    = "CloudWatchLogsAndTelemetry"
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents",
-          "cloudwatch:PutMetricData",
-          "xray:PutTraceSegments",
-          "xray:PutTelemetryRecords"
-        ]
-        Resource = "*"
       }
     ]
   })
 }
 
-resource "aws_iam_role_policy_attachment" "lambda_attach_custom" {
-  role       = aws_iam_role.lambda_exec.name
-  policy_arn = aws_iam_policy.lambda_genai_policy.arn
+resource "aws_iam_role_policy_attachment" "orchestrator_vpc_access" {
+  role       = aws_iam_role.orchestrator_exec.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
-resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
-  role       = aws_iam_role.lambda_exec.name
+# 4b. Ingestion Worker Role (Titan Embeddings + S3 Tenant Prefix Read + AOSS Index/Write; ZERO Claude access)
+resource "aws_iam_role" "ingestion_exec" {
+  name               = "${var.project_name}-ingestion-role"
+  assume_role_policy = local.assume_lambda_policy
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy" "ingestion_policy" {
+  name = "${var.project_name}-ingestion-least-privilege"
+  role = aws_iam_role.ingestion_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "BedrockTitanEmbeddingOnly"
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel"
+        ]
+        Resource = [
+          "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.embedding_model_id}"
+        ]
+      },
+      {
+        Sid    = "S3ReadTenantDocumentsOnly"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject"
+        ]
+        Resource = [
+          "${aws_s3_bucket.knowledge_documents.arn}/tenants/*"
+        ]
+      },
+      {
+        Sid    = "OpenSearchServerlessCollectionEndpointAccess"
+        Effect = "Allow"
+        Action = [
+          "aoss:APIAccessAll"
+        ]
+        Resource = [module.opensearch_serverless.collection_arn]
+      },
+      {
+        Sid    = "KMSDecryptAndGenerateDataKey"
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ]
+        Resource = [module.security.kms_key_arn]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ingestion_vpc_access" {
+  role       = aws_iam_role.ingestion_exec.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+# 4c. Ingress Identity Gatekeeper Role (Seals JWT Tenant Context & Starts Step Functions)
+resource "aws_iam_role" "auth_gatekeeper_exec" {
+  name               = "${var.project_name}-auth-gatekeeper-role"
+  assume_role_policy = local.assume_lambda_policy
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy" "auth_gatekeeper_policy" {
+  name = "${var.project_name}-auth-gatekeeper-least-privilege"
+  role = aws_iam_role.auth_gatekeeper_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "StartAgentStateMachine"
+        Effect = "Allow"
+        Action = [
+          "states:StartExecution"
+        ]
+        Resource = [module.orchestrator_step_functions.state_machine_arn]
+      },
+      {
+        Sid    = "ReadTenantContextHMACSecret"
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [aws_secretsmanager_secret.tenant_context_hmac.arn]
+      },
+      {
+        Sid    = "KMSDecryptSecret"
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt"
+        ]
+        Resource = [module.security.kms_key_arn]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "auth_gatekeeper_basic" {
+  role       = aws_iam_role.auth_gatekeeper_exec.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
 # ==============================================================================
-# OpenSearch Serverless Vector Collection
+# 5. OpenSearch Serverless Vector Collection (CMK Encrypted + Private VPCE)
 # ==============================================================================
 module "opensearch_serverless" {
-  source                    = "./modules/opensearch_serverless"
-  project_name              = var.project_name
-  environment               = var.environment
-  kms_key_arn               = module.security.kms_key_arn
-  lambda_execution_role_arn = aws_iam_role.lambda_exec.arn
-  tags                      = var.tags
+  source                  = "./modules/opensearch_serverless"
+  project_name            = var.project_name
+  environment             = var.environment
+  kms_key_arn             = module.security.kms_key_arn
+  vpc_id                  = aws_vpc.genai_vpc.id
+  private_subnet_ids      = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+  vpce_security_group_ids = [aws_security_group.vpce_sg.id]
+  orchestrator_role_arn   = aws_iam_role.orchestrator_exec.arn
+  ingestion_role_arn      = aws_iam_role.ingestion_exec.arn
+  tags                    = var.tags
 }
 
 # ==============================================================================
-# Bedrock Guardrails Module
+# 6. Bedrock Guardrails Module
 # ==============================================================================
 module "bedrock_agent" {
   source       = "./modules/bedrock_agent"
@@ -183,33 +443,40 @@ module "bedrock_agent" {
 }
 
 # ==============================================================================
-# Lambda Functions (Orchestrator & Ingestion)
+# 7. Lambda Functions (Orchestrator, Ingestion, & Auth Gatekeeper)
 # ==============================================================================
-data "archive_file" "orchestrator_zip" {
+data "archive_file" "runtime_zip" {
   type        = "zip"
   source_dir  = "${path.module}/../src"
-  output_path = "${path.module}/build/orchestrator.zip"
+  output_path = "${path.module}/build/runtime.zip"
 }
 
 resource "aws_lambda_function" "orchestrator" {
-  filename         = data.archive_file.orchestrator_zip.output_path
+  filename         = data.archive_file.runtime_zip.output_path
   function_name    = "${var.project_name}-orchestrator"
-  role             = aws_iam_role.lambda_exec.arn
+  role             = aws_iam_role.orchestrator_exec.arn
   handler          = "orchestrator.handler.lambda_handler"
   runtime          = "python3.11"
   timeout          = 300
   memory_size      = 1024
-  source_code_hash = data.archive_file.orchestrator_zip.output_base64sha256
+  source_code_hash = data.archive_file.runtime_zip.output_base64sha256
+
+  vpc_config {
+    subnet_ids         = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+    security_group_ids = [aws_security_group.lambda_sg.id]
+  }
 
   environment {
     variables = {
-      PRIMARY_CLAUDE_MODEL_ID  = var.primary_claude_model_id
-      FALLBACK_CLAUDE_MODEL_ID = var.fallback_claude_model_id
-      BEDROCK_GUARDRAIL_ID     = element(split("/", module.bedrock_agent.guardrail_arn), length(split("/", module.bedrock_agent.guardrail_arn)) - 1)
-      BEDROCK_GUARDRAIL_VER    = module.bedrock_agent.guardrail_version
-      OPENSEARCH_ENDPOINT      = module.opensearch_serverless.collection_endpoint
-      POWERTOOLS_SERVICE_NAME  = "claude-orchestrator"
-      LOG_LEVEL                = "INFO"
+      PRIMARY_CLAUDE_MODEL_ID   = var.primary_claude_model_id
+      FALLBACK_CLAUDE_MODEL_ID  = var.fallback_claude_model_id
+      EMBEDDING_MODEL_ID        = var.embedding_model_id
+      BEDROCK_GUARDRAIL_ID      = element(split("/", module.bedrock_agent.guardrail_arn), length(split("/", module.bedrock_agent.guardrail_arn)) - 1)
+      BEDROCK_GUARDRAIL_VER     = module.bedrock_agent.guardrail_version
+      OPENSEARCH_ENDPOINT       = module.opensearch_serverless.collection_endpoint
+      TENANT_CONTEXT_SECRET_ARN = aws_secretsmanager_secret.tenant_context_hmac.arn
+      POWERTOOLS_SERVICE_NAME   = "claude-orchestrator"
+      LOG_LEVEL                 = "INFO"
     }
   }
 
@@ -221,14 +488,19 @@ resource "aws_lambda_function" "orchestrator" {
 }
 
 resource "aws_lambda_function" "ingestion" {
-  filename         = data.archive_file.orchestrator_zip.output_path
+  filename         = data.archive_file.runtime_zip.output_path
   function_name    = "${var.project_name}-ingestion"
-  role             = aws_iam_role.lambda_exec.arn
+  role             = aws_iam_role.ingestion_exec.arn
   handler          = "ingestion.handler.lambda_handler"
   runtime          = "python3.11"
   timeout          = 180
   memory_size      = 512
-  source_code_hash = data.archive_file.orchestrator_zip.output_base64sha256
+  source_code_hash = data.archive_file.runtime_zip.output_base64sha256
+
+  vpc_config {
+    subnet_ids         = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+    security_group_ids = [aws_security_group.lambda_sg.id]
+  }
 
   environment {
     variables = {
@@ -246,8 +518,21 @@ resource "aws_lambda_function" "ingestion" {
   tags = var.tags
 }
 
+# Declarative Vector Index Bootstrapper (Ensures 1,024-dim HNSW knn_vector mapping exists)
+resource "aws_lambda_invocation" "bootstrap_vector_index" {
+  function_name = aws_lambda_function.ingestion.function_name
+
+  input = jsonencode({
+    action = "BOOTSTRAP_INDEX"
+  })
+
+  depends_on = [
+    module.opensearch_serverless
+  ]
+}
+
 # ==============================================================================
-# S3 Document Ingestion Notification
+# 8. S3 Document Ingestion Notification (Scoped to `tenants/` prefix)
 # ==============================================================================
 resource "aws_lambda_permission" "allow_s3_ingestion" {
   statement_id  = "AllowExecutionFromS3Bucket"
@@ -263,13 +548,17 @@ resource "aws_s3_bucket_notification" "document_upload_trigger" {
   lambda_function {
     lambda_function_arn = aws_lambda_function.ingestion.arn
     events              = ["s3:ObjectCreated:*"]
+    filter_prefix       = "tenants/"
   }
 
-  depends_on = [aws_lambda_permission.allow_s3_ingestion]
+  depends_on = [
+    aws_lambda_permission.allow_s3_ingestion,
+    aws_lambda_invocation.bootstrap_vector_index
+  ]
 }
 
 # ==============================================================================
-# Agentic Step Functions State Machine
+# 9. Agentic Step Functions State Machine
 # ==============================================================================
 module "orchestrator_step_functions" {
   source           = "./modules/orchestrator_step_functions"
@@ -281,7 +570,110 @@ module "orchestrator_step_functions" {
 }
 
 # ==============================================================================
-# Observability & CloudWatch Dashboards
+# 10. Tenant Identity Layer (Cognito User Pool + API Gateway JWT Authorizer)
+# ==============================================================================
+resource "aws_cognito_user_pool" "tenant_identity_pool" {
+  name = "${var.project_name}-tenant-pool"
+
+  schema {
+    name                = "tenant_id"
+    attribute_data_type = "String"
+    mutable             = false
+    required            = false
+    string_attribute_constraints {
+      min_length = 3
+      max_length = 64
+    }
+  }
+
+  tags = var.tags
+}
+
+resource "aws_cognito_user_pool_client" "api_client" {
+  name                                 = "${var.project_name}-api-client"
+  user_pool_id                         = aws_cognito_user_pool.tenant_identity_pool.id
+  generate_secret                      = false
+  explicit_auth_flows                  = ["ALLOW_USER_SRP_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
+  allowed_oauth_flows_user_pool_client = false
+}
+
+resource "aws_lambda_function" "auth_gatekeeper" {
+  filename         = data.archive_file.runtime_zip.output_path
+  function_name    = "${var.project_name}-auth-gatekeeper"
+  role             = aws_iam_role.auth_gatekeeper_exec.arn
+  handler          = "auth.handler.lambda_handler"
+  runtime          = "python3.11"
+  timeout          = 30
+  memory_size      = 256
+  source_code_hash = data.archive_file.runtime_zip.output_base64sha256
+
+  environment {
+    variables = {
+      STATE_MACHINE_ARN         = module.orchestrator_step_functions.state_machine_arn
+      TENANT_CONTEXT_SECRET_ARN = aws_secretsmanager_secret.tenant_context_hmac.arn
+      POWERTOOLS_SERVICE_NAME   = "claude-auth-gatekeeper"
+      LOG_LEVEL                 = "INFO"
+    }
+  }
+
+  tracing_config {
+    mode = "Active"
+  }
+
+  tags = var.tags
+}
+
+resource "aws_apigatewayv2_api" "agent_api" {
+  name          = "${var.project_name}-http-api"
+  protocol_type = "HTTP"
+  description   = "Authenticated multi-tenant ingress API for Enterprise Claude Agentic Workflows"
+  tags          = var.tags
+}
+
+resource "aws_apigatewayv2_authorizer" "cognito_jwt" {
+  api_id           = aws_apigatewayv2_api.agent_api.id
+  authorizer_type  = "JWT"
+  identity_sources = ["$request.header.Authorization"]
+  name             = "${var.project_name}-cognito-jwt-authorizer"
+
+  jwt_configuration {
+    audience = [aws_cognito_user_pool_client.api_client.id]
+    issuer   = "https://cognito-idp.${var.aws_region}.amazonaws.com/${aws_cognito_user_pool.tenant_identity_pool.id}"
+  }
+}
+
+resource "aws_apigatewayv2_integration" "gatekeeper_integration" {
+  api_id                 = aws_apigatewayv2_api.agent_api.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.auth_gatekeeper.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "start_execution_route" {
+  api_id             = aws_apigatewayv2_api.agent_api.id
+  route_key          = "POST /v1/agent/executions"
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.gatekeeper_integration.id}"
+}
+
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.agent_api.id
+  name        = "$default"
+  auto_deploy = true
+  tags        = var.tags
+}
+
+resource "aws_lambda_permission" "allow_apigw_gatekeeper" {
+  statement_id  = "AllowExecutionFromAPIGateway"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.auth_gatekeeper.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.agent_api.execution_arn}/*/*"
+}
+
+# ==============================================================================
+# 11. Observability & CloudWatch Dashboards
 # ==============================================================================
 module "observability" {
   source       = "./modules/observability_adot"

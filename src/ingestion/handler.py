@@ -1,10 +1,14 @@
-"""S3 Document Upload Event Ingestion Lambda Handler.
+"""S3 Document Upload Event Ingestion & Vector Index Bootstrapper Lambda Handler.
 
-Triggered via S3 ObjectCreated / EventBridge:
-1. Downloads PDF/Markdown/TXT document from S3.
-2. Chunks document into overlapping passages.
-3. Generates embeddings using Amazon Titan Text Embeddings v2.
-4. Indexes documents into Amazon OpenSearch Serverless vector index.
+Supports two execution modes:
+1. S3 Event Notification (`Records`):
+   - Enforces deterministic tenant binding from the IAM-governed S3 prefix
+     `tenants/<tenant_id>/<document_key>` via `extract_verified_tenant_from_s3_key`.
+   - Ensures the OpenSearch Serverless k-NN vector index mapping exists.
+   - Chunks documents, generates 1,024-dim Amazon Titan Text Embeddings v2,
+     and indexes documents into OpenSearch Serverless.
+2. Index Bootstrap (`{"action": "BOOTSTRAP_INDEX"}`):
+   - Idempotently creates the explicit `knn_vector` HNSW index schema during IaC deployment.
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ import boto3
 from opensearchpy import AWSV4SignerAuth, OpenSearch, RequestsHttpConnection
 
 from ..shared.config import AppConfig
+from ..shared.opensearch_index import EMBEDDING_DIMENSIONS, ensure_vector_index_exists
+from ..shared.tenant_context import extract_verified_tenant_from_s3_key
 from .chunker import TextChunker
 
 logger = logging.getLogger()
@@ -42,6 +48,16 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         timeout=15,
     )
 
+    # Ensure explicit k-NN vector index mapping exists before any document writes
+    created = ensure_vector_index_exists(os_client, config.opensearch_index_name)
+    if event.get("action") == "BOOTSTRAP_INDEX":
+        return {
+            "status": "INDEX_BOOTSTRAPPED",
+            "index_name": config.opensearch_index_name,
+            "newly_created": created,
+            "dimensions": EMBEDDING_DIMENSIONS,
+        }
+
     chunker = TextChunker(chunk_size_words=350, overlap_words=50)
     indexed_count = 0
 
@@ -52,15 +68,23 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         logger.info("Processing S3 object s3://%s/%s", bucket, key)
         obj = s3_client.get_object(Bucket=bucket, Key=key)
-        content_text = obj["Body"].read().decode("utf-8", errors="ignore")
         metadata = obj.get("Metadata", {})
-        tenant_id = metadata.get("tenant-id", "default")
+
+        # Deterministically bind tenant_id from the IAM-governed S3 key prefix `tenants/<tenant_id>/...`
+        tenant_id = extract_verified_tenant_from_s3_key(key, metadata)
+
+        content_text = obj["Body"].read().decode("utf-8", errors="ignore")
         title = metadata.get("title", key.split("/")[-1])
 
         chunks = chunker.chunk(content_text)
         for idx, chunk_text in enumerate(chunks):
-            # Generate embedding
-            payload = json.dumps({"inputText": chunk_text, "dimensions": 1024, "normalize": True})
+            payload = json.dumps(
+                {
+                    "inputText": chunk_text,
+                    "dimensions": EMBEDDING_DIMENSIONS,
+                    "normalize": True,
+                }
+            )
             embed_res = bedrock_client.invoke_model(
                 modelId=config.embedding_model_id,
                 contentType="application/json",
@@ -69,18 +93,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             )
             embedding = json.loads(embed_res["body"].read())["embedding"]
 
+            doc_id = f"{tenant_id}:{key}#{idx}"
             doc = {
-                "document_id": f"{key}#{idx}",
+                "document_id": doc_id,
                 "title": title,
                 "content": chunk_text,
                 "embedding": embedding,
                 "tenant_id": tenant_id,
                 "s3_uri": f"s3://{bucket}/{key}",
+                "chunk_index": idx,
             }
 
             os_client.index(
                 index=config.opensearch_index_name,
-                id=f"{key}#{idx}",
+                id=doc_id,
                 body=doc,
                 refresh=False,
             )

@@ -16,6 +16,12 @@ variable "project_name" {
   default     = "claude-agentic-platform"
 }
 
+variable "vpc_cidr" {
+  description = "CIDR block for the isolated GenAI private VPC."
+  type        = string
+  default     = "10.42.0.0/16"
+}
+
 variable "primary_claude_model_id" {
   description = "Bedrock Model ID for the primary reasoning agent (Anthropic Claude 3.5 Sonnet)."
   type        = string
@@ -29,7 +35,7 @@ variable "fallback_claude_model_id" {
 }
 
 variable "embedding_model_id" {
-  description = "Bedrock Model ID for generating high-dimensional document and query embeddings."
+  description = "Bedrock Model ID for generating 1,024-dimensional document and query embeddings."
   type        = string
   default     = "amazon.titan-embed-text-v2:0"
 }
@@ -38,8 +44,8 @@ variable "tags" {
   description = "Global tags to apply across all deployed AWS resources."
   type        = map(string)
   default = {
-    Project     = "enterprise-claude-agentic-aws-refarch"
-    ManagedBy   = "Terraform"
+    Project      = "enterprise-claude-agentic-aws-refarch"
+    ManagedBy    = "Terraform"
     Architecture = "Serverless-GenAI"
   }
 }
