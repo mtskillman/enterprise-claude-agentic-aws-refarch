@@ -13,6 +13,11 @@ variable "aws_region" {
   description = "AWS region for CloudWatch metrics and dashboards"
 }
 
+variable "state_machine_arn" {
+  type        = string
+  description = "ARN of the Step Functions agent state machine for execution health metrics"
+}
+
 variable "kms_key_arn" {
   type        = string
   description = "KMS Customer Managed Key ARN"

@@ -1,4 +1,4 @@
-"""Unit tests verifying execution polling, result delivery, IDOR isolation, and EMF telemetry."""
+"""Unit tests verifying execution polling, result delivery, IDOR isolation, and EMF/OTel telemetry."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ class TestExecutionLifecycleAndTelemetry(unittest.TestCase):
         self.signing_secret = "b" * 64
         self.config = AppConfig(
             aws_region="us-east-1",
-            state_machine_arn="arn:aws:states:us-east-1:123456789012:stateMachine:enterprise-claude-orchestrator",
+            state_machine_arn="arn:aws:states:us-east-1:123456789012:stateMachine:enterprise-claude-agent-state-machine",
             tenant_context_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:tenant-hmac",
         )
 
@@ -40,7 +40,7 @@ class TestExecutionLifecycleAndTelemetry(unittest.TestCase):
 
         mock_sfn = MagicMock()
         mock_sfn.start_execution.return_value = {
-            "executionArn": "arn:aws:states:us-east-1:123456789012:execution:enterprise-claude-orchestrator:exec-12345"
+            "executionArn": "arn:aws:states:us-east-1:123456789012:execution:enterprise-claude-agent-state-machine:exec-12345"
         }
 
         event = {
@@ -62,11 +62,15 @@ class TestExecutionLifecycleAndTelemetry(unittest.TestCase):
         self.assertEqual(body["tenant_id"], "tenant-acme")
         self.assertEqual(body["poll_url"], "/v1/agent/executions/exec-12345")
 
-    def test_get_execution_running_status(self) -> None:
+    def test_get_execution_running_status_authorized(self) -> None:
         mock_sfn = MagicMock()
         mock_sfn.describe_execution.return_value = {
             "status": "RUNNING",
             "startDate": "2026-11-05T08:00:00Z",
+            "input": json.dumps({
+                "auth_context": {"tenant_id": "tenant-acme", "principal_sub": "user-999"},
+                "messages": [{"role": "user", "content": [{"text": "Query"}]}],
+            }),
         }
 
         event = {
@@ -85,6 +89,30 @@ class TestExecutionLifecycleAndTelemetry(unittest.TestCase):
         body = json.loads(resp["body"])
         self.assertEqual(body["status"], "RUNNING")
         self.assertEqual(body["execution_id"], "exec-12345")
+        self.assertEqual(body["tenant_id"], "tenant-acme")
+
+    def test_get_execution_running_cross_tenant_blocked(self) -> None:
+        mock_sfn = MagicMock()
+        mock_sfn.describe_execution.return_value = {
+            "status": "RUNNING",
+            "startDate": "2026-11-05T08:00:00Z",
+            "input": json.dumps({
+                "auth_context": {"tenant_id": "tenant-victim", "principal_sub": "victim-user"},
+            }),
+        }
+
+        event = {
+            "pathParameters": {"execution_id": "exec-running-victim"}
+        }
+
+        with self.assertRaises(TenantIsolationError):
+            _handle_get_execution(
+                event=event,
+                principal_sub="attacker-user",
+                verified_tenant_id="tenant-attacker",
+                config=self.config,
+                sfn_client=mock_sfn,
+            )
 
     def test_get_execution_succeeded_delivers_response(self) -> None:
         mock_sfn = MagicMock()
@@ -106,6 +134,9 @@ class TestExecutionLifecycleAndTelemetry(unittest.TestCase):
         }
         mock_sfn.describe_execution.return_value = {
             "status": "SUCCEEDED",
+            "input": json.dumps({
+                "auth_context": {"tenant_id": "tenant-acme", "principal_sub": "user-999"},
+            }),
             "output": json.dumps(sfn_output),
         }
 
@@ -133,13 +164,16 @@ class TestExecutionLifecycleAndTelemetry(unittest.TestCase):
         sfn_output = {
             "status": "SUCCEEDED",
             "auth_context": {
-                "tenant_id": "tenant-victim",  # Execution belongs to victim
+                "tenant_id": "tenant-victim",
                 "principal_sub": "victim-user",
             },
             "messages": [{"role": "assistant", "content": [{"text": "Sensitive victim data."}]}],
         }
         mock_sfn.describe_execution.return_value = {
             "status": "SUCCEEDED",
+            "input": json.dumps({
+                "auth_context": {"tenant_id": "tenant-victim", "principal_sub": "victim-user"},
+            }),
             "output": json.dumps(sfn_output),
         }
 
@@ -153,6 +187,51 @@ class TestExecutionLifecycleAndTelemetry(unittest.TestCase):
                 event=event,
                 principal_sub="attacker-user",
                 verified_tenant_id="tenant-attacker",
+                config=self.config,
+                sfn_client=mock_sfn,
+            )
+
+    def test_get_execution_failed_cross_tenant_blocked(self) -> None:
+        mock_sfn = MagicMock()
+        mock_sfn.describe_execution.return_value = {
+            "status": "FAILED",
+            "error": "InternalEngineFailure",
+            "cause": "Sensitive internal stack trace",
+            "input": json.dumps({
+                "auth_context": {"tenant_id": "tenant-victim", "principal_sub": "victim-user"},
+            }),
+        }
+
+        event = {
+            "pathParameters": {"execution_id": "exec-failed-victim"}
+        }
+
+        with self.assertRaises(TenantIsolationError):
+            _handle_get_execution(
+                event=event,
+                principal_sub="attacker-user",
+                verified_tenant_id="tenant-attacker",
+                config=self.config,
+                sfn_client=mock_sfn,
+            )
+
+    def test_get_execution_missing_tenant_blocked(self) -> None:
+        mock_sfn = MagicMock()
+        mock_sfn.describe_execution.return_value = {
+            "status": "SUCCEEDED",
+            "input": json.dumps({"messages": []}),  # Missing auth_context / tenant_id
+            "output": json.dumps({"messages": []}),
+        }
+
+        event = {
+            "pathParameters": {"execution_id": "exec-missing-tenant"}
+        }
+
+        with self.assertRaises(TenantIsolationError):
+            _handle_get_execution(
+                event=event,
+                principal_sub="any-user",
+                verified_tenant_id="tenant-acme",
                 config=self.config,
                 sfn_client=mock_sfn,
             )

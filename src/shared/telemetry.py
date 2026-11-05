@@ -1,7 +1,7 @@
 """OpenTelemetry GenAI Semantic Conventions & CloudWatch EMF Cost Telemetry.
 
 Instruments Anthropic Claude model invocations on Amazon Bedrock with
-OpenTelemetry-compliant distributed tracing, latency profiling, and real-time
+real OpenTelemetry distributed tracing spans, latency profiling, and real-time
 CloudWatch Embedded Metric Format (EMF) multi-tenant cost attribution.
 """
 
@@ -15,6 +15,26 @@ import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger()
+
+# Attempt to configure actual OpenTelemetry TracerProvider
+_OTEL_AVAILABLE = False
+try:
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExporter
+    from opentelemetry.trace import Status, StatusCode
+
+    if not isinstance(trace.get_tracer_provider(), TracerProvider):
+        provider = TracerProvider()
+        # In Lambda/container environments without OTLP collector, ConsoleSpanExporter emits structured span logs
+        provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+        trace.set_tracer_provider(provider)
+
+    _tracer = trace.get_tracer("enterprise-claude-agentic-aws-refarch")
+    _OTEL_AVAILABLE = True
+except Exception as err:
+    logger.debug("OpenTelemetry SDK not active in local environment: %s", err)
+    _tracer = None
 
 
 class GenAITelemetry:
@@ -86,7 +106,7 @@ class GenAITelemetry:
         latency_ms: float = 0.0,
         tool_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Emit real-time CloudWatch EMF metrics and return OpenTelemetry attributes."""
+        """Emit real OpenTelemetry span and real-time CloudWatch EMF metrics."""
         cost = cls.calculate_cost(model_id, input_tokens, output_tokens)
         attrs = cls.create_span_attributes(
             model_id=model_id,
@@ -96,7 +116,16 @@ class GenAITelemetry:
             tool_name=tool_name,
         )
 
-        # Emit CloudWatch Embedded Metric Format (EMF)
+        # 1. Create and end an authentic OpenTelemetry distributed trace span
+        if _OTEL_AVAILABLE and _tracer is not None:
+            try:
+                span_name = f"gen_ai.client.turn {model_id}"
+                with _tracer.start_as_current_span(span_name, attributes=attrs) as span:
+                    span.set_status(Status(StatusCode.OK))
+            except Exception as span_err:
+                logger.warning("Failed to emit OpenTelemetry span: %s", span_err)
+
+        # 2. Emit CloudWatch Embedded Metric Format (EMF)
         # CloudWatch extracts these high-cardinality multi-tenant metrics with zero API latency.
         now_ms = int(time.time() * 1000)
         emf_payload = {

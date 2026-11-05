@@ -22,16 +22,14 @@ if [ ! -f "${REQUIREMENTS_FILE}" ]; then
     exit 1
 fi
 
-echo "==> Installing dependencies into layer directory..."
+echo "==> Locating Python package installer..."
 if command -v pip3 &> /dev/null; then
     PIP_CMD="pip3"
 elif command -v pip &> /dev/null; then
     PIP_CMD="pip"
 else
-    echo "WARNING: Neither pip3 nor pip found. Creating placeholder layer structure."
-    mkdir -p "${LAYER_BUILD_DIR}/opensearchpy"
-    echo "# Dependency layer placeholder" > "${LAYER_BUILD_DIR}/opensearchpy/__init__.py"
-    exit 0
+    echo "ERROR: Neither pip3 nor pip found in PATH. Cannot build Lambda dependency layer." >&2
+    exit 1
 fi
 
 # Attempt binary wheels for Linux Python 3.11; fallback to standard target install
@@ -49,6 +47,12 @@ else
         --target "${LAYER_BUILD_DIR}" \
         --requirement "${REQUIREMENTS_FILE}" \
         --no-user
+fi
+
+# Verify required production modules were actually installed
+if [ ! -d "${LAYER_BUILD_DIR}/opensearchpy" ]; then
+    echo "ERROR: Required package 'opensearchpy' was not found in ${LAYER_BUILD_DIR}." >&2
+    exit 1
 fi
 
 # Clean up unwanted artifacts

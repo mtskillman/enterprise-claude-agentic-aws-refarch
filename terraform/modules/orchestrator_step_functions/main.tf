@@ -57,8 +57,8 @@ resource "aws_sfn_state_machine" "agentic_loop" {
   })
 
   logging_configuration {
-    level                  = "ALL"
-    include_execution_data = true
+    level                  = "ERROR"
+    include_execution_data = false
     log_destination        = "${aws_cloudwatch_log_group.sfn_logs.arn}:*"
   }
 

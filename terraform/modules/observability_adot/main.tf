@@ -11,7 +11,7 @@ resource "aws_cloudwatch_dashboard" "genai_dashboard" {
         height = 6
         properties = {
           metrics = [
-            ["EnterpriseClaude/AgenticWorkflows", "EstimatedCostUSD", "TenantId", "default", { stat = "Sum", period = 300, label = "Estimated FinOps Cost (USD)" }]
+            [{ expression = "SEARCH('{EnterpriseClaude/AgenticWorkflows,TenantId} MetricName=\"EstimatedCostUSD\"', 'Sum', 300)", id = "cost_by_tenant", period = 300 }]
           ]
           view    = "timeSeries"
           stacked = false
@@ -33,14 +33,12 @@ resource "aws_cloudwatch_dashboard" "genai_dashboard" {
         height = 6
         properties = {
           metrics = [
-            ["EnterpriseClaude/AgenticWorkflows", "InputTokens", "TenantId", "default", { stat = "Sum", period = 300, label = "Input Tokens" }],
-            [".", "OutputTokens", ".", ".", { stat = "Sum", period = 300, label = "Output Tokens" }],
-            [".", "TotalTokens", ".", ".", { stat = "Sum", period = 300, label = "Total Tokens" }]
+            [{ expression = "SEARCH('{EnterpriseClaude/AgenticWorkflows,TenantId} MetricName=\"TotalTokens\"', 'Sum', 300)", id = "tokens_by_tenant", period = 300 }]
           ]
           view    = "timeSeries"
           stacked = true
           region  = var.aws_region
-          title   = "Token Consumption Breakdown (Input vs. Output Tokens by Tenant)"
+          title   = "Token Consumption Breakdown (Total Tokens by Tenant)"
         }
       },
       {
@@ -68,7 +66,7 @@ resource "aws_cloudwatch_dashboard" "genai_dashboard" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${var.project_name}-orchestrator", { stat = "Sum", period = 300, label = "Executions Succeeded" }],
+            ["AWS/States", "ExecutionsSucceeded", "StateMachineArn", var.state_machine_arn, { stat = "Sum", period = 300, label = "Executions Succeeded" }],
             [".", "ExecutionsFailed", ".", ".", { stat = "Sum", period = 300, label = "Executions Failed" }],
             [".", "ExecutionsTimedOut", ".", ".", { stat = "Sum", period = 300, label = "Executions Timed Out" }]
           ]

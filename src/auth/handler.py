@@ -207,6 +207,40 @@ def _handle_get_execution(
             }
         raise
 
+    # 1. MANDATORY ZERO-TRUST TENANT VERIFICATION ACROSS ALL STATUSES
+    # An execution MUST contain a verifiable tenant binding matching caller's verified_tenant_id.
+    # We verify this BEFORE returning metadata or error details for ANY execution state.
+    exec_tenant = None
+    raw_input = describe_resp.get("input")
+    if raw_input:
+        try:
+            input_data = json.loads(raw_input) if isinstance(raw_input, str) else raw_input
+            exec_tenant = input_data.get("auth_context", {}).get("tenant_id")
+        except Exception as err:
+            logger.error("Failed to parse execution input for tenant validation: %s", err)
+
+    if not exec_tenant and "output" in describe_resp:
+        try:
+            raw_output = describe_resp["output"]
+            output_data = json.loads(raw_output) if isinstance(raw_output, str) else raw_output
+            exec_tenant = output_data.get("auth_context", {}).get("tenant_id")
+        except Exception:
+            pass
+
+    if not exec_tenant:
+        logger.error("Execution '%s' lacks verifiable tenant binding in auth_context.", execution_id)
+        raise TenantIsolationError("Execution lacks verifiable tenant identity context.")
+
+    if exec_tenant != verified_tenant_id:
+        logger.warning(
+            "Cross-tenant IDOR access blocked: caller tenant '%s' attempted to access execution of tenant '%s'",
+            verified_tenant_id,
+            exec_tenant,
+        )
+        raise TenantIsolationError(
+            "Caller is not authorized to access execution results belonging to another tenant."
+        )
+
     status = describe_resp.get("status")
 
     if status == "RUNNING":
@@ -227,25 +261,6 @@ def _handle_get_execution(
     if status == "SUCCEEDED":
         raw_output = describe_resp.get("output", "{}")
         output_data = json.loads(raw_output) if isinstance(raw_output, str) else raw_output
-
-        # Strict Tenant Authorization Check: Ensure the execution belongs to the authenticated tenant
-        exec_tenant = output_data.get("auth_context", {}).get("tenant_id")
-        if not exec_tenant and "input" in describe_resp:
-            try:
-                input_data = json.loads(describe_resp["input"])
-                exec_tenant = input_data.get("auth_context", {}).get("tenant_id")
-            except Exception:
-                pass
-
-        if exec_tenant and exec_tenant != verified_tenant_id:
-            logger.warning(
-                "Cross-tenant IDOR access blocked: caller tenant '%s' attempted to access execution of tenant '%s'",
-                verified_tenant_id,
-                exec_tenant,
-            )
-            raise TenantIsolationError(
-                "Caller is not authorized to access execution results belonging to another tenant."
-            )
 
         # Extract the assistant's final response text
         messages = output_data.get("messages", [])

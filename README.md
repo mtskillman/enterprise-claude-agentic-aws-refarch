@@ -134,21 +134,23 @@ Rather than sharing a single broad execution role across services, the architect
 2. **Ingestion Role (`ingestion_exec`)**: Scoped to Titan embeddings invocation only (**cannot invoke Claude generative LLMs**), read-only access to `s3://<bucket>/tenants/*`, and write/index permissions on OpenSearch Serverless (`aoss:WriteDocument`, `aoss:CreateIndex`).
 3. **Auth Gatekeeper Role (`auth_gatekeeper_exec`)**: Scoped strictly to managing Step Functions executions (`StartExecution`, `DescribeExecution`) and managing the HMAC signing secret container.
 
-### 6. Complete Asynchronous Query Lifecycle & Result Delivery
-Unlike naive prototypes that accept requests and drop results into a black box, this architecture implements a production-grade asynchronous lifecycle:
+### 6. Universal Asynchronous Query Lifecycle & Zero-Leakage Polling
+Unlike naive prototypes that accept requests and drop results into a black box, this architecture implements an end-to-end verified asynchronous lifecycle:
 - **`POST /v1/agent/executions`**: Validates JWT tenant claims, seals `VerifiedTenantContext`, initiates the Step Functions state machine, and immediately returns HTTP `202 ACCEPTED` with `execution_id`, `execution_arn`, and `poll_url`.
-- **`GET /v1/agent/executions/{execution_id}`**: Enables clients to poll execution health. When `RUNNING`, it returns progress metadata. When `SUCCEEDED`, it **strictly verifies that the execution's sealed `tenant_id` matches the caller's JWT `custom:tenant_id`**, preventing any horizontal privilege escalation (IDOR), and delivers the assistant's final response text, reasoning iterations, and FinOps telemetry.
+- **`GET /v1/agent/executions/{execution_id}`**: Enforces **pre-status tenant verification** across all states (`RUNNING`, `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `ABORTED`). Before disclosing running status, start times, or error details, the handler parses the execution's sealed `auth_context` and verifies ownership against caller's JWT `custom:tenant_id`. Cross-tenant probes and missing tenant bindings are rejected immediately with HTTP 403 Forbidden.
+- **Data Privacy (Zero CloudWatch Log Leakage)**: Step Functions logging is configured with `include_execution_data = false` and `level = "ERROR"`. Prompts, retrieved vector chunks, and model answers are never persisted to CloudWatch log streams.
 
-### 7. Zero-Trust State Hygiene & Lambda Dependency Layering
+### 7. Zero-Trust State Hygiene & Fail-Fast Dependency Layering
 - **Zero Sensitive Data in Terraform State**: Plaintext HMAC signing keys are never declared via `random_password` or written to `.tfstate`. The Gatekeeper Lambda auto-seeds a cryptographically secure 256-bit key on first boot directly in AWS Secrets Manager under KMS CMK encryption (or operators seed/rotate it out-of-band via `scripts/seed_hmac_secret.sh`).
-- **Deterministic Dependency Layering**: An automated Lambda Layer (`opensearch_dependencies`) compiles Linux x86_64 binary wheels for `opensearch-py 2.8.0` and `requests-aws4auth 1.3.1`, ensuring seamless runtime operation and preventing `ImportError` blockers during index bootstrapping.
+- **Fail-Fast Dependency Layering**: An automated Lambda Layer (`opensearch_dependencies`) compiles Linux x86_64 binary wheels for `opensearch-py 2.8.0`, `requests-aws4auth 1.3.1`, and OpenTelemetry SDK packages. The build script verifies package installation and fails fast with `exit 1` if dependencies are missing, preventing phantom layers from deploying.
 - **Remote Backend Baseline**: Includes `terraform/backend.tf.example` configuring encrypted S3 state with DynamoDB locking.
 
-### 8. Real-Time CloudWatch EMF & OpenTelemetry GenAI FinOps Telemetry
-Model invocations are instrumented with **CloudWatch Embedded Metric Format (EMF)** and OpenTelemetry GenAI Semantic Conventions v1.27.0:
+### 8. Real-Time CloudWatch EMF, OpenTelemetry Spans & Multi-Tenant SEARCH
+Model invocations are instrumented with **authentic OpenTelemetry distributed tracing spans** (`gen_ai.client.turn`) and **CloudWatch Embedded Metric Format (EMF)**:
 - Zero-latency metric publication to custom CloudWatch namespace `EnterpriseClaude/AgenticWorkflows`.
 - Real-time attribution of `EstimatedCostUSD`, `InputTokens`, `OutputTokens`, and `TurnLatencyMs` dimensioned by `TenantId` and `ModelId`.
-- CloudWatch Dashboard with dynamic regional support tracking real-time dollar costs and token burn per tenant.
+- CloudWatch Dashboard using dynamic `SEARCH()` metric expressions to discover and graph real-time dollar costs and token burn across all tenants without hardcoded filters.
+- Exact binding between Step Functions execution metrics and the deployed state machine ARN.
 
 ---
 
@@ -218,7 +220,7 @@ Model invocations are instrumented with **CloudWatch Embedded Metric Format (EMF
 | [ADR-0002](docs/adr/0002-opensearch-serverless-vs-pgvector.md) | OpenSearch Serverless vs. Amazon Aurora pgvector | Selected OpenSearch Serverless for combined BM25 keyword matching and dense vector search without database maintenance overhead. |
 | [ADR-0003](docs/adr/0003-step-functions-vs-in-memory-loops.md) | Step Functions vs. In-Memory Agent Loops | Externalize agent control flow to Step Functions to bypass Lambda 15-minute limits, avoid runaway token burn, and capture auditable state. |
 | [ADR-0004](docs/adr/0004-cryptographic-tenant-isolation-and-iam-separation.md) | Cryptographic Tenant Isolation & IAM Separation | Bind tenant identity via JWT authorizers and HMAC-SHA256 signatures; enforce S3 key prefixes and decompose Lambda execution roles. |
-| [ADR-0005](docs/adr/0005-dependency-layering-async-delivery-and-state-security.md) | Layering, Async Delivery & State Security | Automate opensearch-py Lambda layer; deliver async responses via polling route with IDOR isolation; eliminate secrets from Terraform state. |
+| [ADR-0005](docs/adr/0005-dependency-layering-async-delivery-and-state-security.md) | Universal IDOR Isolation, Data Privacy & Layering | Fail-fast opensearch-py packaging; universal pre-status tenant IDOR checks; eliminate CloudWatch execution data leakage. |
 
 ---
 

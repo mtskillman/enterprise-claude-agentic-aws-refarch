@@ -388,7 +388,7 @@ resource "aws_iam_role_policy" "auth_gatekeeper_policy" {
         ]
         Resource = [
           module.orchestrator_step_functions.state_machine_arn,
-          "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:execution:${var.project_name}-orchestrator:*"
+          "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:execution:${module.orchestrator_step_functions.state_machine_name}:*"
         ]
       },
       {
@@ -718,10 +718,11 @@ resource "aws_lambda_permission" "allow_apigw_gatekeeper" {
 # 11. Observability & CloudWatch Dashboards
 # ==============================================================================
 module "observability" {
-  source       = "./modules/observability_adot"
-  project_name = var.project_name
-  environment  = var.environment
-  aws_region   = var.aws_region
-  kms_key_arn  = module.security.kms_key_arn
-  tags         = var.tags
+  source             = "./modules/observability_adot"
+  project_name       = var.project_name
+  environment        = var.environment
+  aws_region         = var.aws_region
+  state_machine_arn  = module.orchestrator_step_functions.state_machine_arn
+  kms_key_arn        = module.security.kms_key_arn
+  tags               = var.tags
 }

@@ -1,52 +1,52 @@
-# ADR 0005: Lambda Dependency Layering, Execution Delivery Polling, and Zero-Trust State Hygiene
+# ADR 0005: Lambda Dependency Layering, Universal Tenant IDOR Isolation, and Execution Data Privacy
 
 ## Status
 Accepted
 
 ## Context
-Following the implementation of cryptographic tenant isolation (ADR 0004), three critical operational and architectural gaps were identified:
-1. **Packaging & Dependency Omission**: The runtime package zipped only `src/`, omitting third-party dependencies (`opensearch-py`, `requests-aws4auth`). Because `terraform apply` executes `aws_lambda_invocation` to bootstrap the vector schema, the deployment failed on import.
-2. **Incomplete Client Delivery Contract**: The API returned HTTP `202 ACCEPTED` with an execution ARN, but provided no API route to poll for execution status or retrieve the completed agent response. Clients could start reasoning tasks without receiving answers.
-3. **Sensitive Data Persistence in Terraform State**: Generating the HMAC signing key in Terraform (`random_password`) stored the plaintext key in `terraform.tfstate`. In environments with shared or local state, this compromises the cryptographic isolation perimeter.
-4. **Telemetry & FinOps Realism**: Telemetry calculations were purely computational without emitting real-time OpenTelemetry GenAI spans or CloudWatch metrics, and CloudWatch dashboards hardcoded `us-east-1`.
+Following the implementation of cryptographic tenant isolation (ADR 0004), deeper architectural analysis uncovered five operational and security vulnerabilities:
+1. **Packaging & Build Fail-Safe**: The layer build script previously fell back to creating a dummy placeholder package if pip was missing. In automated pipelines, this would deploy an unusable layer and crash at runtime instead of failing fast during deployment.
+2. **Incomplete Polling Tenant Verification**: Polling routes returned status early for `RUNNING` executions and error details for `FAILED` executions without first checking the execution's tenant binding. An attacker could probe execution IDs across tenants to discover running workflows or internal stack traces.
+3. **Sensitive Prompt & Retrieval Data Leakage in CloudWatch**: Step Functions logged at `level = ALL` with `include_execution_data = true`, persisting full user prompts, retrieved confidential enterprise documents, and model completions in CloudWatch log streams for 30 days.
+4. **IAM ARN Mismatch**: The Gatekeeper Lambda execution role allowed `DescribeExecution` under `${project_name}-orchestrator`, whereas the deployed state machine was named `${project_name}-agent-state-machine`.
+5. **Observability Specificity**: The CloudWatch dashboard filtered tenant metrics to the literal string `"default"`, and Step Functions metric dimensions used an incorrect hardcoded state machine identifier.
 
 ## Decision
-We implement four architectural improvements across packaging, lifecycle delivery, state hygiene, and observability:
+We enforce strict fail-fast packaging, comprehensive tenant authorization across all states, and zero-leakage workflow privacy:
 
-### 1. Deterministic Lambda Dependency Layering (`opensearch-py`)
-- Standardized runtime requirements in `requirements.txt` (`opensearch-py==2.8.0`, `requests-aws4auth==1.3.1`, `requests>=2.31.0`).
-- Automated layer build via `scripts/build_layer.sh` using cross-platform Linux x86_64 wheel compilation.
+### 1. Fail-Fast Lambda Dependency Packaging
+- Standardized runtime requirements in `requirements.txt` (`opensearch-py==2.8.0`, `requests-aws4auth==1.3.1`, `requests>=2.31.0`, `opentelemetry-api`, `opentelemetry-sdk`).
+- Updated `scripts/build_layer.sh` to immediately halt with `exit 1` if `pip3`/`pip` is unavailable or if `opensearchpy` fails to install, preventing phantom placeholder layers from deploying to AWS Lambda.
 - Codified `aws_lambda_layer_version` (`opensearch_dependencies`) attached to both `orchestrator` and `ingestion` functions.
-- Explicit Terraform dependency (`depends_on = [aws_lambda_layer_version.opensearch_dependencies]`) on the vector index bootstrapper invocation.
 
-### 2. Full Async Lifecycle: Polling & Result Delivery with Tenant IDOR Isolation
-- Codified API Gateway route `GET /v1/agent/executions/{execution_id}` with JWT Authorizer.
-- Implemented `_handle_get_execution` in `src/auth/handler.py`:
-  - When status is `RUNNING`: returns HTTP 200 with start timestamp and running status.
-  - When status is `SUCCEEDED`: extracts output, **enforces that the execution's sealed `tenant_id` matches the caller's verified JWT `custom:tenant_id`**, and delivers the final assistant response text, iteration count, and telemetry.
-  - When cross-tenant access is attempted (IDOR), the request is rejected with HTTP 403 Forbidden.
-- Updated Step Functions state machine `FinalizeResponse` to explicitly format final output payloads.
+### 2. Universal Pre-Check Tenant IDOR Isolation Across All States
+- In `src/auth/handler.py` (`_handle_get_execution`), tenant authorization executes **prior to inspecting any execution status**:
+  - Extracts `tenant_id` from the sealed `auth_context` in execution `input` (and verifies `output` for completed executions).
+  - Rejects missing tenant context with `TenantIsolationError` (HTTP 403).
+  - Rejects mismatched caller tenant with `TenantIsolationError` (HTTP 403).
+- Callers cannot discover running state, start timestamps, error causes, or output payloads belonging to other tenants.
 
-### 3. Zero-Trust State Hygiene (Key Elimination from `.tfstate`)
-- Removed `random_password` and `aws_secretsmanager_secret_version` with plaintext values from Terraform.
-- Managed only the `aws_secretsmanager_secret` container with KMS CMK encryption and resource policies in Terraform.
-- Implemented **dynamic zero-state runtime auto-seeding**: The Auth Gatekeeper dynamically generates a 256-bit cryptographically secure random key on first boot if unseeded, writing directly to Secrets Manager under KMS CMK encryption.
-- Provided `scripts/seed_hmac_secret.sh` for out-of-band operator rotation via AWS CLI.
-- Added `terraform/backend.tf.example` demonstrating production encrypted S3 remote state with DynamoDB locking.
+### 3. Execution Data Privacy (Zero Log Leakage)
+- Configured Step Functions logging in `terraform/modules/orchestrator_step_functions/main.tf` with `include_execution_data = false` and `level = "ERROR"`.
+- Prevents raw prompts, retrieved knowledge passages, and assistant answers from being persisted into CloudWatch logs.
 
-### 4. True CloudWatch EMF & OpenTelemetry GenAI Emission
-- Updated `src/shared/telemetry.py` to emit **CloudWatch Embedded Metric Format (EMF)** directly to stdout (`EnterpriseClaude/AgenticWorkflows` namespace with `TenantId` and `ModelId` dimensions).
-- Emitted metrics: `EstimatedCostUSD`, `InputTokens`, `OutputTokens`, `TotalTokens`, and `TurnLatencyMs`.
-- Updated CloudWatch dashboard to use dynamic `${var.aws_region}` and display real-time per-tenant FinOps costs, token consumption, and P95 latency.
+### 4. IAM ARN Scope Alignment
+- In `terraform/main.tf`, bound the `states:DescribeExecution` resource dynamically to `${module.orchestrator_step_functions.state_machine_name}`:
+  `arn:aws:states:${var.aws_region}:${account_id}:execution:${module.orchestrator_step_functions.state_machine_name}:*`
+- Guarantees exact alignment between IAM policies and Step Functions execution ARNs.
+
+### 5. Multi-Tenant CloudWatch Metric SEARCH & OpenTelemetry Spans
+- Integrated OpenTelemetry distributed tracing in `src/shared/telemetry.py` emitting `gen_ai.client.turn` spans with standard GenAI semantic conventions.
+- Updated `terraform/modules/observability_adot/main.tf` to use CloudWatch `SEARCH()` expressions (`SEARCH('{EnterpriseClaude/AgenticWorkflows,TenantId} MetricName="EstimatedCostUSD"', 'Sum', 300)`), dynamically plotting metrics across all real tenants.
+- Bound Step Functions execution metrics directly to `var.state_machine_arn`.
 
 ## Consequences
 
 ### Positive
-- Fully self-contained deployments: `terraform apply` succeeds deterministically with all Python dependencies staged.
-- Complete API contract: callers can initiate queries and poll for validated, decrypted answers.
-- State file compromises cannot leak HMAC signing keys, preserving horizontal tenant isolation.
-- FinOps visibility: infrastructure operators and tenant administrators can monitor real-time dollar costs and token burn by tenant.
+- Zero data leakage: Prompts and confidential documents never enter CloudWatch execution log streams.
+- Complete IDOR protection: No execution status or error metadata is accessible across tenant boundaries.
+- Build determinism: Missing build dependencies fail immediately in CI/CD rather than silently deploying broken layers.
+- Real-time multi-tenant FinOps: CloudWatch dynamically visualizes actual tenant cost and token usage.
 
 ### Trade-offs
-- First invocation of the Gatekeeper executes an initial KMS encryption call if the secret is unseeded.
-- Callers must poll `GET /v1/agent/executions/{execution_id}` until execution finishes.
+- Setting `include_execution_data = false` requires debugging specific state payloads via execution replay or authenticated API polling rather than CloudWatch logs.
