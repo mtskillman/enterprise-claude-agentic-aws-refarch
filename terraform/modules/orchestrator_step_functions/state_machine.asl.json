@@ -1,0 +1,92 @@
+{
+  "Comment": "Enterprise Claude Agentic Loop State Machine on AWS",
+  "StartAt": "ClaudeInferenceTurn",
+  "States": {
+    "ClaudeInferenceTurn": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AgentLambdaArn}",
+        "Payload": {
+          "action": "INFERENCE",
+          "tenant_id.$": "$.tenant_id",
+          "messages.$": "$.messages",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultSelector": {
+        "status.$": "$.Payload.status",
+        "has_tool_use.$": "$.Payload.has_tool_use",
+        "tool_requests.$": "$.Payload.tool_requests",
+        "messages.$": "$.Payload.messages",
+        "iteration.$": "$.Payload.iteration",
+        "telemetry.$": "$.Payload.telemetry",
+        "tenant_id.$": "$.Payload.telemetry.tenant.id"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "EvaluateReasoningStatus"
+    },
+    "EvaluateReasoningStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.iteration",
+          "NumericGreaterThanEquals": 10,
+          "Next": "MaxIterationsFallback"
+        },
+        {
+          "Variable": "$.has_tool_use",
+          "BooleanEquals": true,
+          "Next": "ExecuteAgentTools"
+        }
+      ],
+      "Default": "FinalizeResponse"
+    },
+    "ExecuteAgentTools": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AgentLambdaArn}",
+        "Payload": {
+          "action": "TOOL_EXECUTION",
+          "tool_requests.$": "$.tool_requests",
+          "messages.$": "$.messages",
+          "tenant_id.$": "$.tenant_id",
+          "iteration.$": "$.iteration"
+        }
+      },
+      "ResultSelector": {
+        "messages.$": "$.Payload.messages",
+        "tenant_id.$": "$.Payload.tenant_id",
+        "iteration.$": "$.Payload.iteration"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "ClaudeInferenceTurn"
+    },
+    "FinalizeResponse": {
+      "Type": "Pass",
+      "End": true
+    },
+    "MaxIterationsFallback": {
+      "Type": "Fail",
+      "Error": "AgentMaxIterationsExceeded",
+      "Cause": "The agent exceeded the maximum allowable reasoning iterations (10) without completing."
+    }
+  }
+}
