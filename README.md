@@ -37,8 +37,8 @@ flowchart TD
         SecretsManager["AWS Secrets Manager<br/>(KMS CMK Encrypted Signing Key)"]
         S3Bucket["S3 Knowledge Documents Bucket<br/>(KMS CMK Encrypted)<br/>Prefix Enforced: tenants/{tenant_id}/*"]
 
-        User -->|1. Authenticate| Cognito
-        User -->|2. POST /v1/agent/executions (Bearer JWT)| APIGW
+        User -->|"1. Authenticate"| Cognito
+        User -->|"2. POST /v1/agent/executions with Bearer JWT"| APIGW
         APIGW --> GatekeeperLambda
         GatekeeperLambda <--> SecretsManager
     end
@@ -51,20 +51,20 @@ flowchart TD
     subgraph Orchestration["3. Agentic Orchestration Engine (AWS Step Functions)"]
         Init["Init Execution Context & Sealed auth_context"]
         InvokeClaude["Orchestrator Lambda: Invoke Claude 3.5 Sonnet<br/>• Validates HMAC Signature & Expiration<br/>• Scoped IAM Role (Zero S3 Access)"]
-        InspectAction{"Tool Call<br/>Requested?"}
+        InspectAction{"Tool Call Requested?"}
         ExecTools["Orchestrator Lambda: Execute Registered Tools<br/>• Hybrid BM25 + k-NN Search<br/>• Safe AST Arithmetic Calculator"]
-        EvalLimit{"Iteration Count<br/>>= Max Steps?"}
+        EvalLimit{"Iteration Count >= Max Steps?"}
         FormatResponse["Format & Return Final Answer"]
         AbortExecution["Halt with Timeout Safeguard"]
 
-        GatekeeperLambda -->|3. start_execution(signed_context)| Init
+        GatekeeperLambda -->|"3. Start Execution with Signed Context"| Init
         Init --> InvokeClaude
         InvokeClaude --> InspectAction
-        InspectAction -- "Yes (tool_use)" --> ExecTools
+        InspectAction -->|"Yes: tool_use"| ExecTools
         ExecTools --> EvalLimit
-        EvalLimit -- "No" --> InvokeClaude
-        EvalLimit -- "Yes" --> AbortExecution
-        InspectAction -- "No (end_turn)" --> FormatResponse
+        EvalLimit -->|"No"| InvokeClaude
+        EvalLimit -->|"Yes: Exceeded"| AbortExecution
+        InspectAction -->|"No: end_turn"| FormatResponse
     end
 
     subgraph PrivateVPC["4. Zero-Trust Private VPC (No Public Ingress)"]
@@ -80,7 +80,7 @@ flowchart TD
         IngestionLambda["Ingestion Worker Lambda<br/>• Scoped IAM Role (No Claude LLM Access)<br/>• Enforces S3 key prefix: tenants/{tenant_id}/<br/>• Titan Embeddings v2 (1,024-dim)"]
         OpenSearch[("OpenSearch Serverless Collection<br/>• KMS CMK Encrypted (AWSOwnedKey = false)<br/>• Explicit 1,024-dim HNSW knn_vector Index<br/>• Mandatory Filter: tenant_id")]
 
-        S3Bucket -- "s3:ObjectCreated (filter_prefix: tenants/)" --> IngestionLambda
+        S3Bucket -->|"s3:ObjectCreated with tenants/ prefix"| IngestionLambda
         IngestionLambda --> S3_Gateway
         IngestionLambda --> AOSS_VPCE
         AOSS_VPCE --> OpenSearch
