@@ -1,8 +1,7 @@
-# Enterprise Agentic GenAI Reference Architecture on AWS
-### Powered by Anthropic Claude 3.5 Sonnet, Amazon Bedrock, OpenSearch Serverless & AWS Step Functions
+# Enterprise Agentic Reference Architecture on AWS
+### Stateful Agent Orchestration, Multi-Tenant Hybrid Vector RAG & Bedrock Converse Tool Use
 
 [![AWS Bedrock](https://img.shields.io/badge/AWS-Bedrock%20Converse%20API-FF9900?logo=amazon-aws&logoColor=white)](https://aws.amazon.com/bedrock/)
-[![Anthropic Claude](https://img.shields.io/badge/Model-Claude%203.5%20Sonnet-D97706?logo=anthropic&logoColor=white)](https://www.anthropic.com/claude)
 [![OpenSearch Serverless](https://img.shields.io/badge/Vector%20Store-OpenSearch%20Serverless-005FD0?logo=opensearch&logoColor=white)](https://aws.amazon.com/opensearch-service/features/serverless/)
 [![Step Functions](https://img.shields.io/badge/Orchestrator-AWS%20Step%20Functions-FF4F8B?logo=amazon-aws&logoColor=white)](https://aws.amazon.com/step-functions/)
 [![OpenTelemetry](https://img.shields.io/badge/Observability-OpenTelemetry%20%7C%20ADOT-4A154B?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
@@ -13,15 +12,15 @@
 
 ## Executive Summary
 
-This repository presents an **enterprise-grade, production-hardened reference architecture** for deploying autonomous agentic workflows on AWS. Utilizing **Anthropic Claude 3.5 Sonnet** via the **Amazon Bedrock Converse API**, this architecture demonstrates how mission-critical enterprises can implement complex tool use, multi-step deterministic reasoning, cryptographically enforced multi-tenant hybrid retrieval-augmented generation (RAG), and zero-trust security without vendor lock-in or fragile in-memory agent loops.
+This repository provides a production-hardened reference architecture for deploying stateful, multi-tenant agentic workflows on Amazon Web Services (AWS). Utilizing the **Amazon Bedrock Converse API** (configured for the Anthropic Claude model family), this architecture demonstrates how enterprises can implement deterministic tool calling, cryptographically isolated multi-tenant hybrid retrieval-augmented generation (RAG), and zero-trust security boundaries without brittle in-memory loops or unmanaged vendor platforms.
 
-Designed by an Anthropic Claude Certified Architect with over six years of leading AWS enterprise cloud migrations, this blueprint directly solves common enterprise GenAI failure modes:
-1. **Unbounded Agent Loops & Timeouts**: Replacing brittle in-memory while-loops in containerized or Lambda runtimes with stateful, audit-ready **AWS Step Functions** orchestrators.
-2. **Horizontal Privilege Escalation (IDOR) & Tenant Spoofing**: Replacing untrusted caller-supplied tenant arguments with **JWT-verified identity claims sealed via HMAC-SHA256** and storage-layer S3 tenant prefix boundaries.
-3. **Network Perimeter Exposure**: Enforcing **strictly private network isolation** (`AllowFromPublic = false`) using dedicated **OpenSearch Serverless Interface VPC Endpoints** and private Lambda VPC subnets.
-4. **Vector Mapping Drift**: Declaratively establishing explicit 1,024-dimensional HNSW k-NN vector schema definitions with automated index bootstrapping.
-5. **Broad IAM Blast Radii**: Splitting permissions into **three dedicated least-privilege IAM roles** with zero cross-plane leakage between ingestion, query orchestration, and authentication.
-6. **Data Leakage & Runaway Token Costs**: Enforcing dual-layer perimeter defense via **Amazon Bedrock Guardrails v1** and real-time **OpenTelemetry GenAI Semantic Convention** FinOps cost attribution.
+This blueprint systematically addresses critical enterprise failure modes in generative AI adoption:
+1. **Unbounded Agent Loops & Execution Timeouts**: Replaces fragile in-memory while-loops in container or Lambda runtimes with stateful, auditable **AWS Step Functions** orchestrators with deterministic iteration ceilings.
+2. **Horizontal Privilege Escalation (IDOR) & Tenant Spoofing**: Enforces cryptographic tenant identity binding via **JWT-verified identity claims sealed with HMAC-SHA256 signatures** and strict S3 tenant prefix boundaries (`tenants/{tenant_id}/*`).
+3. **Network Perimeter Exposure**: Enforces **strictly private network isolation** (`AllowFromPublic = false`) using dedicated **OpenSearch Serverless Interface VPC Endpoints** and private Lambda VPC subnets.
+4. **Vector Mapping Drift**: Declaratively establishes explicit 1,024-dimensional HNSW k-NN vector schemas with automated Terraform index bootstrapping.
+5. **Broad IAM Blast Radii**: Enforces strict separation of concerns across **three decoupled least-privilege IAM roles** with zero cross-plane permission leakage.
+6. **Data Leakage & Runaway Token Spend**: Enforces perimeter safety via **Amazon Bedrock Guardrails** (automated PII redaction, prompt injection defense) and real-time FinOps cost attribution via **OpenTelemetry GenAI Semantic Conventions** and CloudWatch Embedded Metric Format (EMF).
 
 ---
 
@@ -45,13 +44,13 @@ flowchart TD
     end
 
     subgraph SecurityPerimeter["2. Zero-Trust Security Perimeter"]
-        Guardrails["Amazon Bedrock Guardrails v1<br/>• Automated PII Redaction (SSN, Email, CC)<br/>• Prompt Injection & Jailbreak Defense<br/>• Denied Topics & Boundary Checks"]
+        Guardrails["Amazon Bedrock Guardrails<br/>• Automated PII Redaction (SSN, Email, CC)<br/>• Prompt Injection & Jailbreak Defense<br/>• Denied Topics & Boundary Checks"]
         KMS["AWS KMS Customer Managed Key (CMK)<br/>(Annual Auto-Rotation Enabled)"]
     end
 
     subgraph Orchestration["3. Agentic Orchestration Engine (AWS Step Functions)"]
         Init["Init Execution Context & Sealed auth_context"]
-        InvokeClaude["Orchestrator Lambda: Invoke Claude 3.5 Sonnet<br/>• Validates HMAC Signature & Expiration<br/>• Scoped IAM Role (Zero S3 Access)"]
+        InvokeModel["Orchestrator Lambda: Bedrock Converse Inference<br/>• Claude Model Selection (Sonnet / Haiku)<br/>• Validates HMAC Signature & Expiration<br/>• Scoped IAM Role (Zero S3 Access)"]
         InspectAction{"Tool Call Requested?"}
         ExecTools["Orchestrator Lambda: Execute Registered Tools<br/>• Hybrid BM25 + k-NN Search<br/>• Safe AST Arithmetic Calculator"]
         EvalLimit{"Iteration Count >= Max Steps?"}
@@ -59,11 +58,11 @@ flowchart TD
         AbortExecution["Halt with Timeout Safeguard"]
 
         GatekeeperLambda -->|"3. Start Execution with Signed Context"| Init
-        Init --> InvokeClaude
-        InvokeClaude --> InspectAction
+        Init --> InvokeModel
+        InvokeModel --> InspectAction
         InspectAction -->|"Yes: tool_use"| ExecTools
         ExecTools --> EvalLimit
-        EvalLimit -->|"No"| InvokeClaude
+        EvalLimit -->|"No"| InvokeModel
         EvalLimit -->|"Yes: Exceeded"| AbortExecution
         InspectAction -->|"No: end_turn"| FormatResponse
     end
@@ -74,11 +73,11 @@ flowchart TD
         S3_Gateway["S3 Gateway VPC Endpoint"]
 
         ExecTools --> AOSS_VPCE
-        InvokeClaude --> Bedrock_VPCE
+        InvokeModel --> Bedrock_VPCE
     end
 
     subgraph RAGStorage["5. Multi-Tenant Vector & Hybrid Store"]
-        IngestionLambda["Ingestion Worker Lambda<br/>• Scoped IAM Role (No Claude LLM Access)<br/>• Enforces S3 key prefix: tenants/{tenant_id}/<br/>• Titan Embeddings v2 (1,024-dim)"]
+        IngestionLambda["Ingestion Worker Lambda<br/>• Scoped IAM Role (No Generative Model Access)<br/>• Enforces S3 key prefix: tenants/{tenant_id}/<br/>• Titan Embeddings v2 (1,024-dim)"]
         OpenSearch[("OpenSearch Serverless Collection<br/>• KMS CMK Encrypted (AWSOwnedKey = false)<br/>• Explicit 1,024-dim HNSW knn_vector Index<br/>• Mandatory Filter: tenant_id")]
 
         S3Bucket -->|"s3:ObjectCreated with tenants/ prefix"| IngestionLambda
@@ -92,12 +91,12 @@ flowchart TD
         OTel["OpenTelemetry GenAI Traces & Spans"]
         CostTracker["Per-Invocation Cost Attribution"]
         
-        InvokeClaude -.-> OTel
+        InvokeModel -.-> OTel
         OTel -.-> CW
         OTel -.-> CostTracker
     end
 
-    InvokeClaude <--> Guardrails
+    InvokeModel <--> Guardrails
     GatekeeperLambda -.->|"Deliver Verified Response"| User
 ```
 
@@ -130,12 +129,12 @@ To satisfy enterprise SOC2, HIPAA, and ISO 27001 requirements, 100% of persisted
 
 ### 5. Decomposed Least-Privilege IAM Roles
 Rather than sharing a single broad execution role across services, the architecture enforces strict boundary separation across three specialized roles:
-1. **Orchestrator Role (`orchestrator_exec`)**: Scoped to Bedrock Claude (Sonnet/Haiku) and Titan embeddings invoke, read-only search on OpenSearch Serverless (`aoss:ReadDocument`, `aoss:DescribeIndex`), and Secrets Manager HMAC secret read. **Has zero S3 bucket access.**
-2. **Ingestion Role (`ingestion_exec`)**: Scoped to Titan embeddings invocation only (**cannot invoke Claude generative LLMs**), read-only access to `s3://<bucket>/tenants/*`, and write/index permissions on OpenSearch Serverless (`aoss:WriteDocument`, `aoss:CreateIndex`).
+1. **Orchestrator Role (`orchestrator_exec`)**: Scoped to Bedrock Converse inference (Claude models) and Titan embeddings invoke, read-only search on OpenSearch Serverless (`aoss:ReadDocument`, `aoss:DescribeIndex`), and Secrets Manager HMAC secret read. **Has zero S3 bucket access.**
+2. **Ingestion Role (`ingestion_exec`)**: Scoped to Titan embeddings invocation only (**cannot invoke generative models**), read-only access to `s3://<bucket>/tenants/*`, and write/index permissions on OpenSearch Serverless (`aoss:WriteDocument`, `aoss:CreateIndex`).
 3. **Auth Gatekeeper Role (`auth_gatekeeper_exec`)**: Scoped strictly to managing Step Functions executions (`StartExecution`, `DescribeExecution`) and managing the HMAC signing secret container.
 
 ### 6. Universal Asynchronous Query Lifecycle & Zero-Leakage Polling
-Unlike naive prototypes that accept requests and drop results into a black box, this architecture implements an end-to-end verified asynchronous lifecycle:
+Unlike naive prototypes that accept requests and drop results into an unmonitored queue, this architecture implements an end-to-end verified asynchronous lifecycle:
 - **`POST /v1/agent/executions`**: Validates JWT tenant claims, seals `VerifiedTenantContext`, initiates the Step Functions state machine, and immediately returns HTTP `202 ACCEPTED` with `execution_id`, `execution_arn`, and `poll_url`.
 - **`GET /v1/agent/executions/{execution_id}`**: Enforces **pre-status tenant verification** across all states (`RUNNING`, `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `ABORTED`). Before disclosing running status, start times, or error details, the handler parses the execution's sealed `auth_context` and verifies ownership against caller's JWT `custom:tenant_id`. Cross-tenant probes and missing tenant bindings are rejected immediately with HTTP 403 Forbidden.
 - **Data Privacy (Zero CloudWatch Log Leakage)**: Step Functions logging is configured with `include_execution_data = false` and `level = "ERROR"`. Prompts, retrieved vector chunks, and model answers are never persisted to CloudWatch log streams.
@@ -145,7 +144,7 @@ Unlike naive prototypes that accept requests and drop results into a black box, 
 - **Fail-Fast Dependency Layering**: An automated Lambda Layer (`opensearch_dependencies`) compiles Linux x86_64 binary wheels for `opensearch-py 2.8.0`, `requests-aws4auth 1.3.1`, and OpenTelemetry SDK packages. The build script verifies package installation and fails fast with `exit 1` if dependencies are missing, preventing phantom layers from deploying.
 - **Remote Backend Baseline**: Includes `terraform/backend.tf.example` configuring encrypted S3 state with DynamoDB locking.
 
-### 8. Real-Time CloudWatch EMF, OpenTelemetry Spans & Multi-Tenant SEARCH
+### 8. Real-Time CloudWatch EMF, OpenTelemetry Spans & Multi-Tenant FinOps
 Model invocations are instrumented with **authentic OpenTelemetry distributed tracing spans** (`gen_ai.client.turn`) and **CloudWatch Embedded Metric Format (EMF)**:
 - Zero-latency metric publication to custom CloudWatch namespace `EnterpriseClaude/AgenticWorkflows`.
 - Real-time attribution of `EstimatedCostUSD`, `InputTokens`, `OutputTokens`, and `TurnLatencyMs` dimensioned by `TenantId` and `ModelId`.
@@ -189,9 +188,9 @@ Model invocations are instrumented with **authentic OpenTelemetry distributed tr
 │   │       ├── calculator.py     # AST-parsed deterministic math calculator
 │   │       └── rag_retriever.py  # OpenSearch Serverless vector + BM25 hybrid retriever
 │   └── ingestion/
-│       ├── __init__.py
-│       ├── handler.py            # S3 event listener (Titan Embeddings v2 vector indexing)
-│       └── chunker.py            # Markdown-aware structural text chunker
+│   │   ├── __init__.py
+│   │   ├── handler.py            # S3 event listener (Titan Embeddings v2 vector indexing)
+│   │   └── chunker.py            # Markdown-aware structural text chunker
 ├── tests/
 │   ├── test_security_and_isolation.py         # Unit tests for HMAC tenant isolation & schema
 │   └── test_execution_lifecycle_and_telemetry.py # Unit tests for polling, IDOR defense & EMF metrics
