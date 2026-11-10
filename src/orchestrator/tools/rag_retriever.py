@@ -8,9 +8,9 @@ from typing import Any, Dict
 import boto3
 from opensearchpy import AWSV4SignerAuth, OpenSearch, RequestsHttpConnection
 
-from ...shared.config import AppConfig
-from ...shared.opensearch_index import EMBEDDING_DIMENSIONS
-from ...shared.tenant_context import VerifiedTenantContext
+from shared.config import AppConfig
+from shared.opensearch_index import EMBEDDING_DIMENSIONS
+from shared.tenant_context import VerifiedTenantContext
 from .base import BaseTool
 
 

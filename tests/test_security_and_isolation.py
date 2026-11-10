@@ -18,9 +18,14 @@ for mod_name in [
     if mod_name not in sys.modules:
         sys.modules[mod_name] = MagicMock()
 
-from src.orchestrator.tools.calculator import SafeCalculatorTool
-from src.shared.opensearch_index import EMBEDDING_DIMENSIONS, KNOWLEDGE_BASE_INDEX_BODY
-from src.shared.tenant_context import (
+# Import modules exactly as the Lambda runtime does: `src/` is the deployment package root.
+import os  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+
+from orchestrator.tools.calculator import SafeCalculatorTool
+from shared.opensearch_index import EMBEDDING_DIMENSIONS, KNOWLEDGE_BASE_INDEX_BODY
+from shared.tenant_context import (
     TenantIsolationError,
     VerifiedTenantContext,
     extract_verified_tenant_from_s3_key,

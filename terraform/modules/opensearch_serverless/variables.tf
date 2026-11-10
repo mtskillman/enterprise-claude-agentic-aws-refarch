@@ -36,6 +36,12 @@ variable "ingestion_role_arn" {
   type        = string
 }
 
+variable "standby_replicas" {
+  description = "ENABLED (production, multi-AZ standby) or DISABLED (dev/test, lower OCU minimum)."
+  type        = string
+  default     = "ENABLED"
+}
+
 variable "tags" {
   type = map(string)
 }

@@ -18,8 +18,8 @@ from typing import Any, Dict
 
 import boto3
 
-from ..shared.config import AppConfig
-from ..shared.tenant_context import TenantIsolationError, VerifiedTenantContext
+from shared.config import AppConfig
+from shared.tenant_context import TenantIsolationError, VerifiedTenantContext
 from .claude_client import ClaudeBedrockClient
 from .tools.calculator import SafeCalculatorTool
 from .tools.rag_retriever import OpenSearchRAGRetrieverTool

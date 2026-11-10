@@ -37,35 +37,39 @@ except Exception as err:
     _tracer = None
 
 
+def _load_pricing() -> Dict[str, Dict[str, float]]:
+    """Load per-1,000-token USD rates from MODEL_PRICING_JSON.
+
+    Bedrock pricing varies by model, Region, inference profile scope, and service
+    tier, so rates are supplied by the operator (Terraform `model_pricing_usd_per_1k_tokens`)
+    rather than hardcoded. Format: {"<model or profile id>": {"input": 0.0, "output": 0.0}}.
+    """
+    raw = os.getenv("MODEL_PRICING_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except ValueError:
+        logger.warning("MODEL_PRICING_JSON is not valid JSON; cost attribution disabled.")
+        return {}
+
+
 class GenAITelemetry:
     """Telemetry and FinOps helper adhering to OpenTelemetry GenAI semantic conventions."""
 
-    PRICING = {
-        # Per 1,000 tokens (USD)
-        "anthropic.claude-3-5-sonnet-20241022-v2:0": {
-            "input": 0.003,
-            "output": 0.015,
-        },
-        "anthropic.claude-3-5-haiku-20241022-v1:0": {
-            "input": 0.0008,
-            "output": 0.004,
-        },
-        "amazon.titan-embed-text-v2:0": {
-            "input": 0.00002,
-            "output": 0.0,
-        },
-    }
-
     EMF_NAMESPACE = "EnterpriseClaude/AgenticWorkflows"
+
+    PRICING: Dict[str, Dict[str, float]] = _load_pricing()
 
     @classmethod
     def calculate_cost(
         cls, model_id: str, input_tokens: int, output_tokens: int
     ) -> float:
-        """Calculate estimated cost in USD based on published AWS Bedrock pricing."""
-        rates = cls.PRICING.get(
-            model_id, {"input": 0.003, "output": 0.015}
-        )
+        """Estimate cost in USD from operator-configured rates; 0.0 if the model is unpriced."""
+        rates = cls.PRICING.get(model_id)
+        if rates is None:
+            logger.warning("No pricing configured for model '%s'; reporting EstimatedCostUSD=0.", model_id)
+            return 0.0
         input_cost = (input_tokens / 1000.0) * rates["input"]
         output_cost = (output_tokens / 1000.0) * rates["output"]
         return round(input_cost + output_cost, 6)

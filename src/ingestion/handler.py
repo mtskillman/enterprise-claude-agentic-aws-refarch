@@ -20,10 +20,11 @@ from typing import Any, Dict
 
 import boto3
 from opensearchpy import AWSV4SignerAuth, OpenSearch, RequestsHttpConnection
+from opensearchpy.exceptions import NotFoundError
 
-from ..shared.config import AppConfig
-from ..shared.opensearch_index import EMBEDDING_DIMENSIONS, ensure_vector_index_exists
-from ..shared.tenant_context import extract_verified_tenant_from_s3_key
+from shared.config import AppConfig
+from shared.opensearch_index import EMBEDDING_DIMENSIONS, ensure_vector_index_exists
+from shared.tenant_context import extract_verified_tenant_from_s3_key
 from .chunker import TextChunker
 
 logger = logging.getLogger()
@@ -76,6 +77,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         content_text = obj["Body"].read().decode("utf-8", errors="ignore")
         title = metadata.get("title", key.split("/")[-1])
 
+        s3_uri = f"s3://{bucket}/{key}"
+
+        # VECTORSEARCH collections assign document IDs server-side, so re-uploads cannot
+        # overwrite by ID. Remove this object's previous chunks before re-indexing it.
+        _delete_existing_chunks(os_client, config.opensearch_index_name, tenant_id, s3_uri)
+
         chunks = chunker.chunk(content_text)
         for idx, chunk_text in enumerate(chunks):
             payload = json.dumps(
@@ -93,23 +100,47 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             )
             embedding = json.loads(embed_res["body"].read())["embedding"]
 
-            doc_id = f"{tenant_id}:{key}#{idx}"
+            # Logical chunk identifier (stored as a field, not used as the OpenSearch _id).
             doc = {
-                "document_id": doc_id,
+                "document_id": f"{tenant_id}:{key}#{idx}",
                 "title": title,
                 "content": chunk_text,
                 "embedding": embedding,
                 "tenant_id": tenant_id,
-                "s3_uri": f"s3://{bucket}/{key}",
+                "s3_uri": s3_uri,
                 "chunk_index": idx,
             }
 
-            os_client.index(
-                index=config.opensearch_index_name,
-                id=doc_id,
-                body=doc,
-                refresh=False,
-            )
+            os_client.index(index=config.opensearch_index_name, body=doc)
             indexed_count += 1
 
     return {"status": "SUCCESS", "indexed_chunks": indexed_count}
+
+
+def _delete_existing_chunks(os_client: OpenSearch, index_name: str, tenant_id: str, s3_uri: str) -> int:
+    """Delete previously indexed chunks of one S3 object (by server-generated _id)."""
+    resp = os_client.search(
+        index=index_name,
+        body={
+            "size": 10000,
+            "_source": False,
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"tenant_id": tenant_id}},
+                        {"term": {"s3_uri": s3_uri}},
+                    ]
+                }
+            },
+        },
+    )
+    deleted = 0
+    for hit in resp.get("hits", {}).get("hits", []):
+        try:
+            os_client.delete(index=index_name, id=hit["_id"])
+            deleted += 1
+        except NotFoundError:
+            pass
+    if deleted:
+        logger.info("Removed %d stale chunks for %s", deleted, s3_uri)
+    return deleted

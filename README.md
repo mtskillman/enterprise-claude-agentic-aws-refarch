@@ -228,7 +228,20 @@ Model invocations are instrumented with **authentic OpenTelemetry distributed tr
 ### Prerequisites
 - [Terraform >= 1.5.0](https://www.terraform.io/downloads.html)
 - [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) configured with Administrator permissions
-- **Amazon Bedrock Model Access**: Ensure `anthropic.claude-3-5-sonnet-20241022-v2:0`, `anthropic.claude-3-5-haiku-20241022-v1:0`, and `amazon.titan-embed-text-v2:0` are enabled in your target AWS region (`us-east-1` or `us-west-2`).
+- **Amazon Bedrock Model Access**: The defaults use the US cross-Region inference profiles `us.anthropic.claude-sonnet-5` (primary) and `us.anthropic.claude-haiku-5-5` (fallback), plus `amazon.titan-embed-text-v2:0`. Anthropic models need a one-time use-case submission in the Bedrock console before first use. Confirm the profiles exist in your Region with `aws bedrock list-inference-profiles`. Terraform grants IAM on both the profile ARN and the underlying foundation model in every Region the profile routes to.
+- **Cost attribution (optional)**: Set `model_pricing_usd_per_1k_tokens` in `terraform.tfvars` from the [Bedrock pricing page](https://aws.amazon.com/bedrock/pricing/). Models without configured rates report `EstimatedCostUSD = 0`.
+
+### Estimated Idle Cost & Cost Profiles
+The stack bills continuously even with no traffic, mostly for OpenSearch Serverless capacity. Approximate idle cost in `us-east-1` (on-demand list prices, before Bedrock and Guardrails usage):
+
+| Profile | `opensearch_standby_replicas` | OpenSearch Serverless minimum | Approx. idle total |
+| :--- | :--- | :--- | :--- |
+| Production (default) | `ENABLED` | 2 OCUs × $0.24/OCU-hour ≈ $350/month | ≈ $400/month |
+| Dev / personal account | `DISABLED` | ~1 OCU ≈ $175/month (no multi-AZ standby) | ≈ $225/month |
+
+The remainder is mostly interface VPC endpoints (about $0.01 per endpoint per AZ-hour) plus small KMS, Secrets Manager, and CloudWatch fees. Lambda, API Gateway, Step Functions, and S3 are billed per request. Bedrock model and Guardrails charges scale with usage; each agent turn resends the growing conversation. Check the [OpenSearch](https://aws.amazon.com/opensearch-service/pricing/) and [Bedrock](https://aws.amazon.com/bedrock/pricing/) pricing pages for current rates, and set an AWS Budget alert before deploying.
+
+**Teardown:** the knowledge bucket is versioned with `force_destroy = false`, so empty it (including noncurrent versions) before `terraform destroy`. The KMS key enters a 30-day pending-deletion window.
 
 ### 1. Clone & Configure
 ```bash
@@ -247,6 +260,8 @@ terraform apply tfplan
 *Terraform packages the `opensearch-py` Lambda Layer, provisions the VPC, OpenSearch Serverless collection, KMS CMK, Bedrock Guardrails, and Step Functions state machine, and automatically triggers the index bootstrapper to initialize the 1,024-dim vector mapping.*
 
 ### 3. Ingest Enterprise Documents Under Tenant Prefix
+The bucket policy lets a principal tagged with `tenant_id` write only under its own `tenants/<tenant_id>/` prefix. Untagged principals can upload only if they are listed in `document_admin_principal_arns`. Before uploading, add your deployment or admin role ARN (the role ARN, not an `sts` session ARN) to that variable in `terraform.tfvars` and re-apply.
+
 Upload documents into the tenant-specific S3 key prefix:
 ```bash
 DOCS_BUCKET=$(terraform output -raw knowledge_bucket_name)
@@ -258,11 +273,23 @@ The Ingestion Lambda validates the `tenants/engineering-dept/` prefix, extracts 
 
 ### 4. End-to-End Query & Result Polling Lifecycle
 
-#### Step 4a: Start Asynchronous Agent Execution
-Call the authenticated HTTP API with a valid Cognito/OIDC JWT Bearer token:
+#### Step 4a: Provision a Tenant User
+Self sign-up is disabled and app clients cannot write `custom:tenant_id`, so tenant membership is assigned only by an administrator:
+```bash
+USER_POOL_ID=$(terraform output -raw cognito_user_pool_id)
+
+aws cognito-idp admin-create-user \
+  --user-pool-id "${USER_POOL_ID}" \
+  --username alice@example.com \
+  --user-attributes Name=email,Value=alice@example.com Name=custom:tenant_id,Value=engineering-dept
+```
+Sign the user in with SRP (for example, with the Amplify Auth library) and use the **ID token** as the bearer token. Cognito access tokens do not carry custom attributes, so the `custom:tenant_id` claim is present only in the ID token.
+
+#### Step 4b: Start Asynchronous Agent Execution
+Call the authenticated HTTP API with the Cognito ID token:
 ```bash
 API_ENDPOINT=$(terraform output -raw api_gateway_endpoint)
-BEARER_TOKEN="<VALID_COGNITO_JWT_TOKEN>"
+BEARER_TOKEN="<COGNITO_ID_TOKEN>"
 
 START_RESP=$(curl -s -X POST "${API_ENDPOINT}" \
   -H "Authorization: Bearer ${BEARER_TOKEN}" \
@@ -278,7 +305,7 @@ echo "${START_RESP}"
 EXECUTION_ID=$(echo "${START_RESP}" | jq -r '.execution_id')
 ```
 
-#### Step 4b: Poll for Completion and Retrieve Answer
+#### Step 4c: Poll for Completion and Retrieve Answer
 Poll the execution endpoint with the authenticated Bearer token:
 ```bash
 POLL_ENDPOINT=$(terraform output -raw api_gateway_poll_endpoint | sed "s/{execution_id}/${EXECUTION_ID}/")
@@ -296,7 +323,7 @@ When complete, the API returns the verified assistant response, reasoning iterat
   "iterations": 2,
   "telemetry": {
     "gen_ai.system": "aws.bedrock",
-    "gen_ai.request.model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    "gen_ai.request.model": "us.anthropic.claude-sonnet-5",
     "gen_ai.usage.estimated_cost_usd": 0.0078,
     "gen_ai.usage.total_tokens": 1420
   }

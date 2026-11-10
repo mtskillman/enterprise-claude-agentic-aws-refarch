@@ -49,8 +49,8 @@ resource "aws_cloudwatch_dashboard" "genai_dashboard" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/Bedrock", "InvocationLatency", "ModelId", "anthropic.claude-3-5-sonnet-20241022-v2:0", { stat = "p95", period = 60, label = "Claude 3.5 Sonnet P95" }],
-            ["...", "anthropic.claude-3-5-haiku-20241022-v1:0", { stat = "p95", period = 60, label = "Claude 3.5 Haiku Fallback P95" }]
+            ["AWS/Bedrock", "InvocationLatency", "ModelId", var.primary_model_id, { stat = "p95", period = 60, label = "Primary model P95" }],
+            ["...", var.fallback_model_id, { stat = "p95", period = 60, label = "Fallback model P95" }]
           ]
           view    = "timeSeries"
           stacked = false

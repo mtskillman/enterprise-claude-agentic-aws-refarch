@@ -22,8 +22,8 @@ from typing import Any, Dict, Optional, Tuple
 import boto3
 from botocore.exceptions import ClientError
 
-from ..shared.config import AppConfig
-from ..shared.tenant_context import TenantIsolationError, VerifiedTenantContext
+from shared.config import AppConfig
+from shared.tenant_context import TenantIsolationError, VerifiedTenantContext
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
