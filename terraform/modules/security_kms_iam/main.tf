@@ -36,7 +36,7 @@ resource "aws_kms_key" "genai_key" {
         Resource = "*"
         Condition = {
           StringEquals = {
-            "kms:ViaService"    = "aoss.${data.aws_region.current.name}.amazonaws.com"
+            "kms:ViaService"    = "aoss.${data.aws_region.current.region}.amazonaws.com"
             "kms:CallerAccount" = data.aws_caller_identity.current.account_id
           }
         }
@@ -45,7 +45,7 @@ resource "aws_kms_key" "genai_key" {
         Sid    = "AllowCloudWatchLogs"
         Effect = "Allow"
         Principal = {
-          Service = "logs.${data.aws_region.current.name}.amazonaws.com"
+          Service = "logs.${data.aws_region.current.region}.amazonaws.com"
         }
         Action = [
           "kms:Encrypt*",

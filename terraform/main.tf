@@ -769,13 +769,13 @@ resource "aws_lambda_permission" "allow_apigw_gatekeeper" {
 # 11. Observability & CloudWatch Dashboards
 # ==============================================================================
 module "observability" {
-  source             = "./modules/observability_adot"
-  project_name       = var.project_name
-  environment        = var.environment
-  aws_region         = var.aws_region
-  state_machine_arn  = module.orchestrator_step_functions.state_machine_arn
-  primary_model_id   = var.primary_claude_model_id
-  fallback_model_id  = var.fallback_claude_model_id
-  kms_key_arn        = module.security.kms_key_arn
-  tags               = var.tags
+  source            = "./modules/observability_adot"
+  project_name      = var.project_name
+  environment       = var.environment
+  aws_region        = var.aws_region
+  state_machine_arn = module.orchestrator_step_functions.state_machine_arn
+  primary_model_id  = var.primary_claude_model_id
+  fallback_model_id = var.fallback_claude_model_id
+  kms_key_arn       = module.security.kms_key_arn
+  tags              = var.tags
 }
