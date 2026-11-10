@@ -209,7 +209,8 @@ resource "aws_s3_bucket_policy" "tenant_prefix_isolation" {
         }
       },
       {
-        Sid       = "DenyUploadsOutsidePrincipalTenantPrefix"
+        # Tenant-tagged principals may only write under their own tenants/<tenant_id>/ prefix.
+        Sid       = "DenyTenantPrincipalUploadsOutsideOwnPrefix"
         Effect    = "Deny"
         Principal = "*"
         Action    = "s3:PutObject"
@@ -217,8 +218,27 @@ resource "aws_s3_bucket_policy" "tenant_prefix_isolation" {
           "${aws_s3_bucket.knowledge_documents.arn}/tenants/$${aws:PrincipalTag/tenant_id}/*"
         ]
         Condition = {
-          StringNotEquals = {
-            "aws:PrincipalArn" = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+          Null = {
+            "aws:PrincipalTag/tenant_id" = "false"
+          }
+        }
+      },
+      {
+        # Untagged principals may upload only if listed as document administrators.
+        Sid       = "DenyUntaggedNonAdminUploads"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = ["${aws_s3_bucket.knowledge_documents.arn}/*"]
+        Condition = {
+          Null = {
+            "aws:PrincipalTag/tenant_id" = "true"
+          }
+          ArnNotLike = {
+            "aws:PrincipalArn" = concat(
+              ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"],
+              var.document_admin_principal_arns
+            )
           }
         }
       }
@@ -230,6 +250,19 @@ resource "aws_s3_bucket_policy" "tenant_prefix_isolation" {
 # 4. Separated Least-Privilege IAM Execution Roles
 # ==============================================================================
 locals {
+  # Cross-Region inference profiles (us./eu./global. ...) need IAM on BOTH the profile
+  # ARN and the underlying foundation model in every Region the profile can route to.
+  inference_profile_prefix_re = "^(us|eu|apac|au|ca|jp|in|global)\\."
+  claude_invoke_arns = flatten([
+    for model_id in distinct([var.primary_claude_model_id, var.fallback_claude_model_id]) :
+    can(regex(local.inference_profile_prefix_re, model_id)) ? tolist([
+      "arn:aws:bedrock:${var.aws_region}:${data.aws_caller_identity.current.account_id}:inference-profile/${model_id}",
+      "arn:aws:bedrock:*::foundation-model/${replace(model_id, "/${local.inference_profile_prefix_re}/", "")}",
+      ]) : tolist([
+      "arn:aws:bedrock:${var.aws_region}::foundation-model/${model_id}",
+    ])
+  ])
+
   assume_lambda_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -263,12 +296,13 @@ resource "aws_iam_role_policy" "orchestrator_policy" {
           "bedrock:InvokeModel",
           "bedrock:ApplyGuardrail"
         ]
-        Resource = [
-          "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.primary_claude_model_id}",
-          "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.fallback_claude_model_id}",
-          "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.embedding_model_id}",
-          module.bedrock_agent.guardrail_arn
-        ]
+        Resource = concat(
+          local.claude_invoke_arns,
+          [
+            "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.embedding_model_id}",
+            module.bedrock_agent.guardrail_arn
+          ]
+        )
       },
       {
         Sid    = "OpenSearchServerlessCollectionEndpointAccess"
@@ -507,6 +541,7 @@ resource "aws_lambda_function" "orchestrator" {
       BEDROCK_GUARDRAIL_VER     = module.bedrock_agent.guardrail_version
       OPENSEARCH_ENDPOINT       = module.opensearch_serverless.collection_endpoint
       TENANT_CONTEXT_SECRET_ARN = aws_secretsmanager_secret.tenant_context_hmac.arn
+      MODEL_PRICING_JSON        = jsonencode(var.model_pricing_usd_per_1k_tokens)
       POWERTOOLS_SERVICE_NAME   = "claude-orchestrator"
       LOG_LEVEL                 = "INFO"
     }
@@ -609,6 +644,12 @@ module "orchestrator_step_functions" {
 resource "aws_cognito_user_pool" "tenant_identity_pool" {
   name = "${var.project_name}-tenant-pool"
 
+  # Tenant membership is assigned by an administrator, never self-declared. With self
+  # sign-up enabled, any caller could SignUp with an arbitrary custom:tenant_id.
+  admin_create_user_config {
+    allow_admin_create_user_only = true
+  }
+
   schema {
     name                = "tenant_id"
     attribute_data_type = "String"
@@ -629,6 +670,10 @@ resource "aws_cognito_user_pool_client" "api_client" {
   generate_secret                      = false
   explicit_auth_flows                  = ["ALLOW_USER_SRP_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
   allowed_oauth_flows_user_pool_client = false
+
+  # Clients may read the tenant claim but never write it (SignUp / UpdateUserAttributes).
+  read_attributes  = ["email", "email_verified", "name", "custom:tenant_id"]
+  write_attributes = ["email", "name"]
 }
 
 resource "aws_lambda_function" "auth_gatekeeper" {
@@ -723,6 +768,8 @@ module "observability" {
   environment        = var.environment
   aws_region         = var.aws_region
   state_machine_arn  = module.orchestrator_step_functions.state_machine_arn
+  primary_model_id   = var.primary_claude_model_id
+  fallback_model_id  = var.fallback_claude_model_id
   kms_key_arn        = module.security.kms_key_arn
   tags               = var.tags
 }

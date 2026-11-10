@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List
 
 import boto3
 from botocore.exceptions import ClientError
 
-from ..shared.config import AppConfig
-from ..shared.telemetry import GenAITelemetry
+from shared.config import AppConfig
+from shared.telemetry import GenAITelemetry
 from .tools.base import BaseTool
 
 logger = logging.getLogger(__name__)
@@ -44,9 +45,12 @@ class ClaudeBedrockClient:
             "system": [{"text": system_prompt}],
             "inferenceConfig": {
                 "maxTokens": self.config.max_tokens,
-                "temperature": self.config.temperature,
             },
         }
+        # Only send temperature when explicitly configured: current Claude models run
+        # adaptive thinking by default, which constrains sampling parameters.
+        if self.config.temperature is not None:
+            params["inferenceConfig"]["temperature"] = self.config.temperature
         if tool_config:
             params["toolConfig"] = tool_config
 

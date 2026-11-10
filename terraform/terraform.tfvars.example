@@ -1,9 +1,18 @@
 aws_region               = "us-east-1"
 environment              = "prod"
 project_name             = "claude-agentic-platform"
-primary_claude_model_id  = "anthropic.claude-3-5-sonnet-20241022-v2:0"
-fallback_claude_model_id = "anthropic.claude-3-5-haiku-20241022-v1:0"
+primary_claude_model_id  = "us.anthropic.claude-sonnet-5"
+fallback_claude_model_id = "us.anthropic.claude-haiku-5-5"
 embedding_model_id       = "amazon.titan-embed-text-v2:0"
+
+# Fill in from https://aws.amazon.com/bedrock/pricing/ for your Region and profile scope.
+# model_pricing_usd_per_1k_tokens = {
+#   "us.anthropic.claude-sonnet-5"  = { input = 0.0, output = 0.0 }
+#   "us.anthropic.claude-haiku-5-5" = { input = 0.0, output = 0.0 }
+# }
+
+# Roles allowed to upload documents for any tenant (for example your deployment or admin role).
+# document_admin_principal_arns = ["arn:aws:iam::<ACCOUNT_ID>:role/<ADMIN_ROLE_NAME>"]
 
 tags = {
   Project      = "enterprise-claude-agentic-aws-refarch"

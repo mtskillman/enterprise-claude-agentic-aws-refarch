@@ -99,6 +99,7 @@ resource "aws_opensearchserverless_access_policy" "data_access" {
             "aoss:CreateIndex",
             "aoss:UpdateIndex",
             "aoss:DescribeIndex",
+            "aoss:ReadDocument",
             "aoss:WriteDocument"
           ]
         },

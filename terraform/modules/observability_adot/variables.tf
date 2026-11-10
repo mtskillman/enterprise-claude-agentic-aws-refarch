@@ -18,6 +18,16 @@ variable "state_machine_arn" {
   description = "ARN of the Step Functions agent state machine for execution health metrics"
 }
 
+variable "primary_model_id" {
+  type        = string
+  description = "Primary Claude model or inference profile ID (Bedrock ModelId metric dimension)"
+}
+
+variable "fallback_model_id" {
+  type        = string
+  description = "Fallback Claude model or inference profile ID (Bedrock ModelId metric dimension)"
+}
+
 variable "kms_key_arn" {
   type        = string
   description = "KMS Customer Managed Key ARN"

@@ -19,10 +19,15 @@ for mod_name in [
     if mod_name not in sys.modules:
         sys.modules[mod_name] = MagicMock()
 
-from src.auth.handler import _handle_get_execution, _handle_start_execution, lambda_handler
-from src.shared.config import AppConfig
-from src.shared.telemetry import GenAITelemetry
-from src.shared.tenant_context import TenantIsolationError, VerifiedTenantContext
+# Import modules exactly as the Lambda runtime does: `src/` is the deployment package root.
+import os  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+
+from auth.handler import _handle_get_execution, _handle_start_execution, lambda_handler
+from shared.config import AppConfig
+from shared.telemetry import GenAITelemetry
+from shared.tenant_context import TenantIsolationError, VerifiedTenantContext
 
 
 class TestExecutionLifecycleAndTelemetry(unittest.TestCase):
@@ -34,7 +39,7 @@ class TestExecutionLifecycleAndTelemetry(unittest.TestCase):
             tenant_context_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:tenant-hmac",
         )
 
-    @patch("src.auth.handler._get_signing_secret")
+    @patch("auth.handler._get_signing_secret")
     def test_post_execution_returns_202_with_poll_url(self, mock_secret: MagicMock) -> None:
         mock_secret.return_value = self.signing_secret
 
@@ -238,9 +243,11 @@ class TestExecutionLifecycleAndTelemetry(unittest.TestCase):
 
     def test_cloudwatch_emf_telemetry_emission(self) -> None:
         captured_stdout = io.StringIO()
-        with patch("sys.stdout", captured_stdout):
+        # Illustrative test rates only (USD per 1K tokens); real rates come from MODEL_PRICING_JSON.
+        test_rates = {"us.anthropic.claude-sonnet-5": {"input": 0.003, "output": 0.015}}
+        with patch("sys.stdout", captured_stdout), patch.dict(GenAITelemetry.PRICING, test_rates, clear=True):
             attrs = GenAITelemetry.emit_turn_telemetry(
-                model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
+                model_id="us.anthropic.claude-sonnet-5",
                 input_tokens=1000,
                 output_tokens=200,
                 tenant_id="tenant-alpha",
@@ -263,9 +270,13 @@ class TestExecutionLifecycleAndTelemetry(unittest.TestCase):
 
         # Verify OpenTelemetry GenAI Semantic Convention attributes
         self.assertEqual(attrs["gen_ai.system"], "aws.bedrock")
-        self.assertEqual(attrs["gen_ai.request.model"], "anthropic.claude-3-5-sonnet-20241022-v2:0")
+        self.assertEqual(attrs["gen_ai.request.model"], "us.anthropic.claude-sonnet-5")
         self.assertEqual(attrs["tenant.id"], "tenant-alpha")
         self.assertEqual(attrs["gen_ai.usage.estimated_cost_usd"], 0.006)
+
+    def test_unpriced_model_reports_zero_cost(self) -> None:
+        with patch.dict(GenAITelemetry.PRICING, {}, clear=True):
+            self.assertEqual(GenAITelemetry.calculate_cost("us.anthropic.unknown-model", 1000, 1000), 0.0)
 
 
 if __name__ == "__main__":
