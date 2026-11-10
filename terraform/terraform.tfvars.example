@@ -5,6 +5,10 @@ primary_claude_model_id  = "us.anthropic.claude-sonnet-5"
 fallback_claude_model_id = "us.anthropic.claude-haiku-5-5"
 embedding_model_id       = "amazon.titan-embed-text-v2:0"
 
+# Cost profile: set to "DISABLED" for personal/dev accounts to halve the OpenSearch Serverless
+# OCU minimum (no multi-AZ standby). Keep "ENABLED" for production.
+opensearch_standby_replicas = "ENABLED"
+
 # Fill in from https://aws.amazon.com/bedrock/pricing/ for your Region and profile scope.
 # model_pricing_usd_per_1k_tokens = {
 #   "us.anthropic.claude-sonnet-5"  = { input = 0.0, output = 0.0 }

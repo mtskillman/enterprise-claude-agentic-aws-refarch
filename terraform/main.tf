@@ -465,6 +465,7 @@ module "opensearch_serverless" {
   vpce_security_group_ids = [aws_security_group.vpce_sg.id]
   orchestrator_role_arn   = aws_iam_role.orchestrator_exec.arn
   ingestion_role_arn      = aws_iam_role.ingestion_exec.arn
+  standby_replicas        = var.opensearch_standby_replicas
   tags                    = var.tags
 }
 
@@ -589,6 +590,11 @@ resource "aws_lambda_function" "ingestion" {
 # Declarative Vector Index Bootstrapper (Ensures 1,024-dim HNSW knn_vector mapping exists)
 resource "aws_lambda_invocation" "bootstrap_vector_index" {
   function_name = aws_lambda_function.ingestion.function_name
+
+  # Re-run the bootstrapper whenever the collection is replaced (e.g. standby_replicas change).
+  triggers = {
+    collection_id = module.opensearch_serverless.collection_id
+  }
 
   input = jsonencode({
     action = "BOOTSTRAP_INDEX"

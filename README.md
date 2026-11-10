@@ -231,6 +231,18 @@ Model invocations are instrumented with **authentic OpenTelemetry distributed tr
 - **Amazon Bedrock Model Access**: The defaults use the US cross-Region inference profiles `us.anthropic.claude-sonnet-5` (primary) and `us.anthropic.claude-haiku-5-5` (fallback), plus `amazon.titan-embed-text-v2:0`. Anthropic models need a one-time use-case submission in the Bedrock console before first use. Confirm the profiles exist in your Region with `aws bedrock list-inference-profiles`. Terraform grants IAM on both the profile ARN and the underlying foundation model in every Region the profile routes to.
 - **Cost attribution (optional)**: Set `model_pricing_usd_per_1k_tokens` in `terraform.tfvars` from the [Bedrock pricing page](https://aws.amazon.com/bedrock/pricing/). Models without configured rates report `EstimatedCostUSD = 0`.
 
+### Estimated Idle Cost & Cost Profiles
+The stack bills continuously even with no traffic, mostly for OpenSearch Serverless capacity. Approximate idle cost in `us-east-1` (on-demand list prices, before Bedrock and Guardrails usage):
+
+| Profile | `opensearch_standby_replicas` | OpenSearch Serverless minimum | Approx. idle total |
+| :--- | :--- | :--- | :--- |
+| Production (default) | `ENABLED` | 2 OCUs × $0.24/OCU-hour ≈ $350/month | ≈ $400/month |
+| Dev / personal account | `DISABLED` | ~1 OCU ≈ $175/month (no multi-AZ standby) | ≈ $225/month |
+
+The remainder is mostly interface VPC endpoints (about $0.01 per endpoint per AZ-hour) plus small KMS, Secrets Manager, and CloudWatch fees. Lambda, API Gateway, Step Functions, and S3 are billed per request. Bedrock model and Guardrails charges scale with usage; each agent turn resends the growing conversation. Check the [OpenSearch](https://aws.amazon.com/opensearch-service/pricing/) and [Bedrock](https://aws.amazon.com/bedrock/pricing/) pricing pages for current rates, and set an AWS Budget alert before deploying.
+
+**Teardown:** the knowledge bucket is versioned with `force_destroy = false`, so empty it (including noncurrent versions) before `terraform destroy`. The KMS key enters a 30-day pending-deletion window.
+
 ### 1. Clone & Configure
 ```bash
 git clone git@github.com:mtskillman/enterprise-claude-agentic-aws-refarch.git

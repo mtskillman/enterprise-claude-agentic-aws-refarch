@@ -16,6 +16,17 @@ variable "project_name" {
   default     = "claude-agentic-platform"
 }
 
+variable "opensearch_standby_replicas" {
+  description = "OpenSearch Serverless standby replicas. ENABLED for production (multi-AZ, 2-OCU minimum, about $350/month idle in us-east-1). DISABLED for dev/test (about half the OCU minimum, no AZ redundancy). Changing this replaces the collection and its index."
+  type        = string
+  default     = "ENABLED"
+
+  validation {
+    condition     = contains(["ENABLED", "DISABLED"], var.opensearch_standby_replicas)
+    error_message = "opensearch_standby_replicas must be ENABLED or DISABLED."
+  }
+}
+
 variable "vpc_cidr" {
   description = "CIDR block for the isolated GenAI private VPC."
   type        = string

@@ -68,6 +68,10 @@ resource "aws_opensearchserverless_collection" "knowledge_base" {
   description = "Authoritative enterprise vector search knowledge base (1,024-dim HNSW + BM25)"
   type        = "VECTORSEARCH"
 
+  # ENABLED keeps a standby copy in a second AZ (2-OCU billing minimum). DISABLED halves
+  # the minimum for dev/test at the cost of availability. Changing it replaces the collection.
+  standby_replicas = var.standby_replicas
+
   depends_on = [
     aws_opensearchserverless_security_policy.encryption,
     aws_opensearchserverless_security_policy.network
